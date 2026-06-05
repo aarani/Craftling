@@ -1,0 +1,71 @@
+package handler
+
+import (
+	"github.com/aarani/craftling-go/internal/auth"
+	"github.com/aarani/craftling-go/internal/config"
+	"github.com/aarani/craftling-go/internal/middleware"
+	"github.com/aarani/craftling-go/internal/model"
+	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+)
+
+// NewRouter builds the Gin engine with middleware and routes wired up.
+func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool) *gin.Engine {
+	if cfg.Env == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	jwtManager := auth.NewManager(cfg.JWTSecret, cfg.AccessTTL)
+	userRepo := repository.NewUserRepository(pool)
+	refreshRepo := repository.NewRefreshTokenRepository(pool)
+	gameServerRepo := repository.NewGameServerRepository(pool)
+	authHandler := NewAuthHandler(userRepo, refreshRepo, jwtManager, cfg.RefreshTTL)
+	adminHandler := NewAdminHandler(userRepo, gameServerRepo)
+	serverHandler := NewServerHandler(gameServerRepo)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.RequestID())
+	r.Use(middleware.RequestLogger(log))
+
+	r.GET("/healthz", Health)
+
+	api := r.Group("/api/v1")
+	{
+		api.GET("/ping", Ping)
+		api.POST("/auth/register", authHandler.Register)
+		api.POST("/auth/login", authHandler.Login)
+		api.POST("/auth/refresh", authHandler.Refresh)
+		api.POST("/auth/logout", authHandler.Logout)
+
+		// Routes requiring a valid access token.
+		protected := api.Group("")
+		protected.Use(middleware.Auth(jwtManager))
+		{
+			protected.GET("/me", authHandler.Me)
+		}
+
+		// Game server CRUD (owner-scoped).
+		servers := api.Group("/servers")
+		servers.Use(middleware.Auth(jwtManager))
+		{
+			servers.POST("", serverHandler.Create)
+			servers.GET("", serverHandler.List)
+			servers.GET("/:id", serverHandler.Get)
+			servers.PATCH("/:id", serverHandler.Update)
+			servers.DELETE("/:id", serverHandler.Delete)
+		}
+
+		// Admin-only routes.
+		admin := api.Group("/admin")
+		admin.Use(middleware.Auth(jwtManager), middleware.RequireRole(model.RoleAdmin))
+		{
+			admin.GET("/users", adminHandler.ListUsers)
+			admin.GET("/servers", adminHandler.ListServers)
+		}
+	}
+
+	return r
+}

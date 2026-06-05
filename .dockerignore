@@ -1,0 +1,11 @@
+.git/
+.gitignore
+.env
+bin/
+*.md
+Makefile
+.dockerignore
+Dockerfile
+.idea/
+.vscode/
+.DS_Store

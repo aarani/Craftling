@@ -1,0 +1,172 @@
+package handler
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/aarani/craftling-go/internal/logger"
+	"github.com/aarani/craftling-go/internal/middleware"
+	"github.com/aarani/craftling-go/internal/model"
+	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+)
+
+// Default resource allocation for a new server.
+const (
+	defaultCPUs     = 2
+	defaultMemoryMB = 2048
+)
+
+// ServerHandler serves the game-server CRUD endpoints.
+type ServerHandler struct {
+	servers *repository.GameServerRepository
+}
+
+// NewServerHandler constructs a ServerHandler.
+func NewServerHandler(servers *repository.GameServerRepository) *ServerHandler {
+	return &ServerHandler{servers: servers}
+}
+
+type createServerRequest struct {
+	Name     string `json:"name" binding:"required,min=1,max=64"`
+	Version  string `json:"version" binding:"required"`
+	CPUs     int    `json:"cpus" binding:"omitempty,min=1,max=16"`
+	MemoryMB int    `json:"memory_mb" binding:"omitempty,min=512,max=65536"`
+}
+
+type updateServerRequest struct {
+	Name         *string `json:"name" binding:"omitempty,min=1,max=64"`
+	Version      *string `json:"version" binding:"omitempty,min=1"`
+	DesiredState *string `json:"desired_state" binding:"omitempty,oneof=running stopped"`
+}
+
+// Create provisions a new game server (desired state: running).
+func (h *ServerHandler) Create(c *gin.Context) {
+	var req createServerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	s := &model.GameServer{
+		OwnerID:      middleware.UserIDFromContext(c),
+		Name:         req.Name,
+		Game:         model.GameMinecraft,
+		Version:      req.Version,
+		CPUs:         orDefault(req.CPUs, defaultCPUs),
+		MemoryMB:     orDefault(req.MemoryMB, defaultMemoryMB),
+		DesiredState: model.DesiredRunning,
+		Status:       model.StatusPending,
+	}
+	if err := h.servers.Create(c.Request.Context(), s); err != nil {
+		logger.FromContext(c).Error("create server", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusCreated, s)
+}
+
+// List returns the authenticated user's servers.
+func (h *ServerHandler) List(c *gin.Context) {
+	servers, err := h.servers.ListByOwner(c.Request.Context(), middleware.UserIDFromContext(c))
+	if err != nil {
+		logger.FromContext(c).Error("list servers", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"servers": servers})
+}
+
+// Get returns a single owned server.
+func (h *ServerHandler) Get(c *gin.Context) {
+	s, ok := h.ownedOr404(c)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, s)
+}
+
+// Update edits the spec and/or desired state of an owned server.
+func (h *ServerHandler) Update(c *gin.Context) {
+	var req updateServerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	s, ok := h.ownedOr404(c)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+
+	if req.Name != nil || req.Version != nil {
+		name, version := s.Name, s.Version
+		if req.Name != nil {
+			name = *req.Name
+		}
+		if req.Version != nil {
+			version = *req.Version
+		}
+		if err := h.servers.UpdateSpec(ctx, s.ID, name, version); err != nil {
+			logger.FromContext(c).Error("update server spec", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+	}
+
+	if req.DesiredState != nil {
+		if err := h.servers.SetDesiredState(ctx, s.ID, *req.DesiredState); err != nil {
+			logger.FromContext(c).Error("set desired state", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+	}
+
+	updated, err := h.servers.GetByID(ctx, s.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, updated)
+}
+
+// Delete marks an owned server for teardown; the reconciler removes it.
+func (h *ServerHandler) Delete(c *gin.Context) {
+	s, ok := h.ownedOr404(c)
+	if !ok {
+		return
+	}
+	if err := h.servers.SetDesiredState(c.Request.Context(), s.ID, model.DesiredDeleted); err != nil {
+		logger.FromContext(c).Error("mark server deleted", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"status": "deleting"})
+}
+
+// ownedOr404 loads the server in the URL and verifies the caller owns it.
+// It writes a 404 for both missing and non-owned servers (no existence leak).
+func (h *ServerHandler) ownedOr404(c *gin.Context) (*model.GameServer, bool) {
+	s, err := h.servers.GetByID(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if !errors.Is(err, repository.ErrNotFound) {
+			logger.FromContext(c).Error("get server", zap.Error(err))
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+		return nil, false
+	}
+	if s.OwnerID != middleware.UserIDFromContext(c) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+		return nil, false
+	}
+	return s, true
+}
+
+func orDefault(v, d int) int {
+	if v <= 0 {
+		return d
+	}
+	return v
+}
