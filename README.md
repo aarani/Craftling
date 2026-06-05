@@ -3,7 +3,7 @@
 A Go HTTP service built with [Gin](https://github.com/gin-gonic/gin).
 
 The control plane for a multi-host, Firecracker-microVM Minecraft hosting
-platform. See [PLAN.md](PLAN.md) for the phased roadmap from here to production.
+platform. See [PLAN.md](docs/PLAN.md) for the phased roadmap from here to production.
 
 ## Requirements
 
