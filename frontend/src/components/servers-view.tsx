@@ -1,179 +1,180 @@
-/* servers-view.tsx — Game Servers view: table, filters, lifecycle, detail + create drawers. */
+/* servers-view.tsx — Game Servers view wired to the control-plane API:
+ * list (owner- or fleet-scoped), lifecycle actions, and live status polling. */
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Icon } from "./icon"
 import { Btn, CopyBtn, Menu, Meter, StatusBadge } from "./primitives"
 import { ServerDrawer, CreateDrawer, type CreateSpec } from "./drawers"
-import { FILTERS, MAX_HOST_CPU, MAX_HOST_MEM } from "./servers-shared"
-import {
-  HOSTS,
-  SERVERS,
-  fmtMem,
-  hostById,
-  ownerById,
-  srv,
-  type Role,
-  type Server,
-  type ServerStatus,
-} from "@/lib/data"
-
-type Patch = Partial<Server>
-type Step = [ServerStatus, number, ((s: Server) => Patch)?]
+import { FILTERS } from "./servers-shared"
+import { api, toServer, ApiError, type ApiServer } from "@/lib/api"
+import { useAuth } from "@/lib/auth"
+import { fmtMem, type Owner, type Role, type Server, type ServerStatus } from "@/lib/data"
 
 const TRANSITIONING: ServerStatus[] = ["scheduling", "provisioning", "starting", "stopping"]
 const CAN_START: ServerStatus[] = ["stopped", "error", "unschedulable"]
 const CAN_STOP: ServerStatus[] = ["running", "starting", "provisioning"]
 
+const POLL_MS = 2500
+
+// While an optimistic action is in flight we hold a transitioning label until
+// the backend's observed status actually moves off `from`.
+interface Pending {
+  show: ServerStatus
+  from: ServerStatus
+}
+
+function ownerFromEmail(id: string, email: string): Owner {
+  const local = email.split("@")[0]
+  const initials = (local.replace(/[^a-z0-9]/gi, "").slice(0, 2) || "??").toUpperCase()
+  return { id, name: email, email, initials }
+}
+
 export function ServersView({
   role,
-  zone,
   onCountChange,
 }: {
   role: Role
-  zone: string
   onCountChange?: (n: number) => void
 }) {
-  const [servers, setServers] = useState<Server[]>(() => SERVERS.map((s) => ({ ...s })))
+  const { user } = useAuth()
+  const isOwner = role === "owner"
+
+  const [servers, setServers] = useState<Server[]>([])
+  const [owners, setOwners] = useState<Record<string, Owner>>({})
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState("all")
   const [q, setQ] = useState("")
   const [detail, setDetail] = useState<string | null>(null) // server id
   const [creating, setCreating] = useState(false)
-  const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
 
-  const isOwner = role === "owner"
-  const meId = "u-anya" // demo owner identity
+  const pending = useRef<Map<string, Pending>>(new Map())
+  const removed = useRef<Set<string>>(new Set())
 
-  // patch one server by id
-  const patch = useCallback((id: string, upd: Patch | ((s: Server) => Patch)) => {
-    setServers((prev) =>
-      prev.map((s) =>
-        s.id === id ? { ...s, ...(typeof upd === "function" ? upd(s) : upd) } : s
-      )
+  // Merge fresh API data with any in-flight optimistic state.
+  const applyServers = useCallback((fresh: ApiServer[]) => {
+    setServers(
+      fresh
+        .filter((a) => !removed.current.has(a.id))
+        .map((a) => {
+          const s = toServer(a)
+          const p = pending.current.get(s.id)
+          if (p) {
+            if (s.status === p.from) return { ...s, status: p.show }
+            pending.current.delete(s.id) // backend has moved on
+          }
+          return s
+        })
     )
   }, [])
 
-  // step a server through a sequence of [status, ms, extra] then settle
-  const runFlow = useCallback(
-    (id: string, steps: Step[]) => {
-      clearTimeout(timers.current[id])
-      let i = 0
-      const tick = () => {
-        if (i >= steps.length) return
-        const [status, ms, extra] = steps[i]
-        i++
-        patch(id, (s) => ({ status, ...(extra ? extra(s) : {}) }))
-        timers.current[id] = setTimeout(tick, ms)
+  // Fetch the current scope's servers (+ owner directory for the fleet view).
+  const fetchScope = useCallback(async () => {
+    if (isOwner) {
+      const list = await api.listServers()
+      const dir = user ? { [user.id]: ownerFromEmail(user.id, user.email) } : {}
+      return { servers: list, owners: dir as Record<string, Owner> }
+    }
+    const [list, users] = await Promise.all([api.adminListServers(), api.adminListUsers()])
+    return {
+      servers: list,
+      owners: Object.fromEntries(users.map((u) => [u.id, ownerFromEmail(u.id, u.email)])),
+    }
+  }, [isOwner, user])
+
+  // Sync wrapper: all state updates happen in promise callbacks, so this is safe
+  // to call from an effect (no synchronous setState in the effect body).
+  const refresh = useCallback(() => {
+    fetchScope()
+      .then(({ servers: s, owners: o }) => {
+        setOwners(o)
+        applyServers(s)
+        setError(null)
+      })
+      .catch((e) =>
+        setError(e instanceof ApiError ? e.message : "Couldn't reach the control plane.")
+      )
+      .finally(() => setLoading(false))
+  }, [fetchScope, applyServers])
+
+  // Initial load + steady poll. Re-runs if the scope (role/user) changes.
+  useEffect(() => {
+    refresh()
+    const t = setInterval(refresh, POLL_MS)
+    return () => clearInterval(t)
+  }, [refresh])
+
+  // Optimistically show `show` for a server, holding until the backend leaves `from`.
+  const optimistic = useCallback((s: Server, show: ServerStatus, statusMessage: string | null) => {
+    pending.current.set(s.id, { show, from: s.status })
+    setServers((prev) => prev.map((x) => (x.id === s.id ? { ...x, status: show, statusMessage } : x)))
+  }, [])
+
+  const runAction = useCallback(
+    async (fn: () => Promise<unknown>) => {
+      try {
+        await fn()
+      } catch (e) {
+        setError(e instanceof ApiError ? e.message : "Action failed.")
+      } finally {
+        refresh()
       }
-      tick()
     },
-    [patch]
+    [refresh]
   )
 
   const startServer = useCallback(
     (s: Server) => {
-      const oversize = s.cpus > MAX_HOST_CPU || s.mem > MAX_HOST_MEM
-      patch(s.id, { desired: "running", attempts: 0, statusMessage: null })
-      if (oversize) {
-        runFlow(s.id, [
-          ["scheduling", 1100, () => ({ statusMessage: "Selecting host with capacity…" })],
-          [
-            "unschedulable",
-            0,
-            () => ({
-              statusMessage: `No ready host fits ${s.cpus} vCPU / ${fmtMem(s.mem)} — largest host is ${MAX_HOST_CPU} vCPU / ${fmtMem(MAX_HOST_MEM)}.`,
-            }),
-          ],
-        ])
-        return
-      }
-      const ready = HOSTS.filter((h) => h.status === "ready")
-      const host = ready[Math.floor(Math.random() * ready.length)]
-      const port = 25565 + Math.floor(Math.random() * 40)
-      runFlow(s.id, [
-        ["scheduling", 1000, () => ({ statusMessage: "Selecting host with capacity…", hostId: null })],
-        [
-          "provisioning",
-          1400,
-          () => ({ statusMessage: `Placed on ${host.hostname} · booting microVM`, hostId: host.id }),
-        ],
-        ["starting", 1500, () => ({ statusMessage: "Pulling world archive · launching server" })],
-        [
-          "running",
-          0,
-          () => ({
-            statusMessage: null,
-            address: host.zone.startsWith("us-east") ? "play.craftling.gg" : host.address,
-            port,
-            health: "healthy",
-            players: 0,
-          }),
-        ],
-      ])
+      optimistic(s, "scheduling", "Selecting host with capacity…")
+      runAction(() => api.updateServer(s.id, { desired_state: "running" }))
     },
-    [patch, runFlow]
+    [optimistic, runAction]
   )
 
   const stopServer = useCallback(
     (s: Server) => {
-      patch(s.id, { desired: "stopped", statusMessage: null })
-      runFlow(s.id, [
-        ["stopping", 1300, () => ({ statusMessage: "RCON save-all · flushing world to object store" })],
-        [
-          "stopped",
-          0,
-          () => ({ statusMessage: null, hostId: null, address: null, port: null, players: 0, health: "—" }),
-        ],
-      ])
+      optimistic(s, "stopping", "Draining and tearing down microVM…")
+      runAction(() => api.updateServer(s.id, { desired_state: "stopped" }))
     },
-    [patch, runFlow]
+    [optimistic, runAction]
   )
 
   const restartServer = useCallback(
     (s: Server) => {
-      runFlow(s.id, [
-        ["stopping", 1100, () => ({ statusMessage: "Graceful stop" })],
-        ["starting", 1500, () => ({ statusMessage: "Re-launching server" })],
-        ["running", 0, () => ({ statusMessage: null, health: "healthy" })],
-      ])
+      optimistic(s, "stopping", "Restarting…")
+      runAction(() => api.restartServer(s.id))
     },
-    [runFlow]
+    [optimistic, runAction]
   )
 
-  const removeServer = useCallback((id: string) => {
-    clearTimeout(timers.current[id])
-    setServers((prev) => prev.filter((s) => s.id !== id))
-    setDetail(null)
-  }, [])
+  const removeServer = useCallback(
+    (id: string) => {
+      removed.current.add(id)
+      pending.current.delete(id)
+      setServers((prev) => prev.filter((s) => s.id !== id))
+      setDetail(null)
+      runAction(() => api.deleteServer(id))
+    },
+    [runAction]
+  )
 
   const addServer = useCallback(
     (spec: CreateSpec) => {
-      const s = srv({
-        ...spec,
-        owner: spec.owner || meId,
-        desired: "running",
-        status: "scheduling",
-        hostId: null,
-        players: 0,
-        createdDays: 0,
-        world: 0,
-        statusMessage: "Selecting host with capacity…",
-      })
-      setServers((prev) => [s, ...prev])
       setCreating(false)
-      setTimeout(() => startServer(s), 60)
+      runAction(() =>
+        api.createServer({
+          name: spec.name,
+          version: spec.version,
+          cpus: spec.cpus,
+          memory_mb: spec.mem,
+        })
+      )
     },
-    [startServer]
+    [runAction]
   )
 
-  // role + zone + filter + query scoping
-  let scoped = servers
-  if (isOwner) scoped = scoped.filter((s) => s.owner === meId)
-  if (role === "operator" && zone !== "all")
-    scoped = scoped.filter((s) => {
-      const h = hostById(s.hostId)
-      return h ? h.zone === zone : false
-    })
+  // filter + query scoping (role scoping is enforced server-side)
   const fdef = FILTERS.find((f) => f.id === filter)!
-  let list = scoped.filter((s) => filter === "all" || (fdef.match && fdef.match(s)))
+  let list = servers.filter((s) => filter === "all" || (fdef.match && fdef.match(s)))
   if (q.trim()) {
     const t = q.toLowerCase()
     list = list.filter(
@@ -185,16 +186,14 @@ export function ServersView({
   }
 
   // stats
-  const running = scoped.filter((s) => s.status === "running")
-  const playersOnline = running.reduce((a, s) => a + s.players, 0)
-  const usedCpu = scoped.filter((s) => s.hostId).reduce((a, s) => a + s.cpus, 0)
-  const fleetCpu = HOSTS.filter((h) => h.status === "ready").reduce((a, h) => a + h.cpus, 0)
+  const running = servers.filter((s) => s.status === "running")
+  const memAllocated = running.reduce((a, s) => a + s.mem, 0)
+  const cpuAllocated = running.reduce((a, s) => a + s.cpus, 0)
 
   useEffect(() => {
-    if (onCountChange) onCountChange(scoped.length)
+    onCountChange?.(servers.length)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scoped.length])
-  useEffect(() => () => Object.values(timers.current).forEach(clearTimeout), [])
+  }, [servers.length])
 
   const detailServer = detail ? servers.find((s) => s.id === detail) : null
 
@@ -214,16 +213,35 @@ export function ServersView({
         </Btn>
       </div>
 
+      {error && (
+        <div
+          className="row gap-2 t-sm"
+          style={{
+            color: "var(--danger-fg)",
+            background: "color-mix(in oklab, var(--danger) 10%, transparent)",
+            padding: "10px 12px",
+            borderRadius: "var(--radius)",
+            alignItems: "center",
+          }}
+        >
+          <Icon name="alert" size={15} style={{ flex: "none" }} />
+          <span>{error}</span>
+          <button className="icon-btn sm" onClick={refresh} style={{ marginLeft: "auto" }}>
+            <Icon name="restart" size={14} />
+          </button>
+        </div>
+      )}
+
       {/* stat tiles */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
         <div className="card stat">
           <div className="k">
             <Icon name="cube" size={14} /> {isOwner ? "My servers" : "Total servers"}
           </div>
-          <div className="v tnum">{scoped.length}</div>
+          <div className="v tnum">{servers.length}</div>
           <div className="sub">
-            {scoped.filter((s) => s.status === "stopped").length} stopped ·{" "}
-            {scoped.filter((s) => ["error", "unschedulable"].includes(s.status)).length} need
+            {servers.filter((s) => s.status === "stopped").length} stopped ·{" "}
+            {servers.filter((s) => ["error", "unschedulable"].includes(s.status)).length} need
             attention
           </div>
         </div>
@@ -235,40 +253,22 @@ export function ServersView({
             {running.length}
           </div>
           <div className="sub">
-            {
-              scoped.filter((s) =>
-                ["scheduling", "provisioning", "starting", "stopping"].includes(s.status)
-              ).length
-            }{" "}
-            transitioning
+            {servers.filter((s) => TRANSITIONING.includes(s.status)).length} transitioning
           </div>
         </div>
         <div className="card stat">
           <div className="k">
-            <Icon name="users" size={14} /> Players online
+            <Icon name="cpu" size={14} /> Allocated vCPU
           </div>
-          <div className="v tnum">{playersOnline}</div>
-          <div className="sub">across {running.length} live servers</div>
+          <div className="v tnum">{cpuAllocated}</div>
+          <div className="sub">across {running.length} running servers</div>
         </div>
         <div className="card stat">
           <div className="k">
-            <Icon name="cpu" size={14} /> {isOwner ? "Allocated vCPU" : "Fleet vCPU"}
+            <Icon name="mem" size={14} /> Allocated memory
           </div>
-          <div className="v tnum">
-            {usedCpu}
-            {!isOwner && (
-              <span className="muted" style={{ fontSize: 16, fontWeight: 500 }}>
-                {" "}
-                / {fleetCpu}
-              </span>
-            )}
-          </div>
-          {!isOwner && (
-            <div style={{ marginTop: 2 }}>
-              <Meter value={usedCpu} max={fleetCpu} />
-            </div>
-          )}
-          {isOwner && <div className="sub">across your running servers</div>}
+          <div className="v tnum">{fmtMem(memAllocated)}</div>
+          <div className="sub">across {running.length} running servers</div>
         </div>
       </div>
 
@@ -278,8 +278,8 @@ export function ServersView({
           {FILTERS.map((f) => {
             const n =
               f.id === "all"
-                ? scoped.length
-                : scoped.filter((s) => f.match && f.match(s)).length
+                ? servers.length
+                : servers.filter((s) => f.match && f.match(s)).length
             return (
               <button
                 key={f.id}
@@ -312,7 +312,6 @@ export function ServersView({
                 <th>Status</th>
                 <th>Version</th>
                 {!isOwner && <th>Owner</th>}
-                {!isOwner && <th>Host · Zone</th>}
                 <th>Resources</th>
                 <th>Players</th>
                 <th>Address</th>
@@ -327,6 +326,7 @@ export function ServersView({
                   key={s.id}
                   s={s}
                   isOwner={isOwner}
+                  owner={owners[s.owner]}
                   onOpen={() => setDetail(s.id)}
                   onStart={() => startServer(s)}
                   onStop={() => stopServer(s)}
@@ -339,16 +339,29 @@ export function ServersView({
         </div>
         {!list.length && (
           <div className="empty">
-            <Icon name="cube" size={30} style={{ opacity: 0.5 }} />
-            <div className="col" style={{ gap: 3, alignItems: "center" }}>
-              <div className="semibold" style={{ color: "var(--foreground)" }}>
-                No servers match
-              </div>
-              <div className="t-sm">Try a different filter or spin up a new server.</div>
-            </div>
-            <Btn variant="primary" size="sm" onClick={() => setCreating(true)}>
-              <Icon name="plus" size={14} /> New Server
-            </Btn>
+            {loading ? (
+              <>
+                <Icon name="restart" className="spin" size={26} style={{ opacity: 0.6 }} />
+                <div className="t-sm">Loading servers…</div>
+              </>
+            ) : (
+              <>
+                <Icon name="cube" size={30} style={{ opacity: 0.5 }} />
+                <div className="col" style={{ gap: 3, alignItems: "center" }}>
+                  <div className="semibold" style={{ color: "var(--foreground)" }}>
+                    {servers.length ? "No servers match" : "No servers yet"}
+                  </div>
+                  <div className="t-sm">
+                    {servers.length
+                      ? "Try a different filter or search."
+                      : "Spin up your first game server."}
+                  </div>
+                </div>
+                <Btn variant="primary" size="sm" onClick={() => setCreating(true)}>
+                  <Icon name="plus" size={14} /> New Server
+                </Btn>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -357,6 +370,7 @@ export function ServersView({
         <ServerDrawer
           s={detailServer}
           isOwner={isOwner}
+          owner={owners[detailServer.owner]}
           onClose={() => setDetail(null)}
           onStart={() => startServer(detailServer)}
           onStop={() => stopServer(detailServer)}
@@ -364,9 +378,7 @@ export function ServersView({
           onDelete={() => removeServer(detailServer.id)}
         />
       )}
-      {creating && (
-        <CreateDrawer role={role} onClose={() => setCreating(false)} onCreate={addServer} />
-      )}
+      {creating && <CreateDrawer onClose={() => setCreating(false)} onCreate={addServer} />}
     </div>
   )
 }
@@ -374,6 +386,7 @@ export function ServersView({
 function ServerRow({
   s,
   isOwner,
+  owner,
   onOpen,
   onStart,
   onStop,
@@ -382,14 +395,13 @@ function ServerRow({
 }: {
   s: Server
   isOwner: boolean
+  owner?: Owner | null
   onOpen: () => void
   onStart: () => void
   onStop: () => void
   onRestart: () => void
   onDelete: () => void
 }) {
-  const host = hostById(s.hostId)
-  const owner = ownerById(s.owner)
   const transitioning = TRANSITIONING.includes(s.status)
   const canStart = CAN_START.includes(s.status)
   const canStop = CAN_STOP.includes(s.status)
@@ -410,9 +422,9 @@ function ServerRow({
               {s.statusMessage}
             </span>
           )}
-          {s.status === "error" && (
-            <span className="t-xs" style={{ color: "var(--danger-fg)" }}>
-              attempt {s.attempts} · backing off
+          {s.status === "error" && s.statusMessage && (
+            <span className="t-xs truncate" style={{ color: "var(--danger-fg)", maxWidth: 230 }}>
+              {s.statusMessage}
             </span>
           )}
         </div>
@@ -430,21 +442,9 @@ function ServerRow({
               >
                 {owner.initials}
               </div>
-              <span className="t-sm truncate" style={{ maxWidth: 110 }}>
+              <span className="t-sm truncate" style={{ maxWidth: 140 }}>
                 {owner.name}
               </span>
-            </div>
-          ) : (
-            <span className="muted">—</span>
-          )}
-        </td>
-      )}
-      {!isOwner && (
-        <td>
-          {host ? (
-            <div className="col" style={{ gap: 1 }}>
-              <span className="mono t-sm">{host.hostname}</span>
-              <span className="t-xs muted">{host.zone}</span>
             </div>
           ) : (
             <span className="muted">—</span>
@@ -464,7 +464,7 @@ function ServerRow({
         </div>
       </td>
       <td>
-        {s.status === "running" ? (
+        {s.status === "running" && s.maxPlayers > 0 ? (
           <div className="col" style={{ gap: 3, minWidth: 64 }}>
             <span className="mono t-sm tnum">
               {s.players}
@@ -513,9 +513,6 @@ function ServerRow({
             </div>
             <div className="menu-item" onClick={onRestart}>
               <Icon name="restart" /> Restart
-            </div>
-            <div className="menu-item">
-              <Icon name="download" /> Download world
             </div>
             <div className="menu-sep" />
             <div className="menu-item danger" onClick={onDelete}>

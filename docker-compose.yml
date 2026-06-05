@@ -1,0 +1,58 @@
+# Full local stack: Postgres + Go control plane + nginx-served frontend.
+#
+#   docker compose up --build
+#
+# Then browse http://localhost:8080 (the frontend proxies /api to the server).
+# The server is also exposed directly on :8081 for debugging.
+name: craftling
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: craftling
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d craftling"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: .
+    environment:
+      PORT: "8080"
+      APP_ENV: production
+      DATABASE_URL: postgres://postgres:postgres@db:5432/craftling?sslmode=disable
+      JWT_SECRET: dev-secret-change-me
+      ACCESS_TTL: 15m
+      REFRESH_TTL: 720h
+      # Seed an admin (operator/fleet-wide view) on first start.
+      ADMIN_EMAIL: admin@craftling.gg
+      ADMIN_PASSWORD: adminpassword
+    ports:
+      - "8081:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      API_UPSTREAM: http://server:8080
+    ports:
+      - "8080:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  pgdata:

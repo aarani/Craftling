@@ -11,4 +11,12 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  server: {
+    // Proxy API + health calls to the Go control plane so the browser stays
+    // same-origin in dev (no CORS). Override the target with VITE_API_TARGET.
+    proxy: {
+      "/api": { target: process.env.VITE_API_TARGET || "http://localhost:8080", changeOrigin: true },
+      "/healthz": { target: process.env.VITE_API_TARGET || "http://localhost:8080", changeOrigin: true },
+    },
+  },
 })

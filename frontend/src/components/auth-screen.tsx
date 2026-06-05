@@ -1,35 +1,41 @@
-/* auth-screen.tsx — sign-in screen with role demo + theme toggle. */
+/* auth-screen.tsx — sign-in / create-account screen wired to the control plane. */
 import { useState } from "react"
 import { Icon, Voxel } from "./icon"
 import { Btn } from "./primitives"
-import type { Role } from "@/lib/data"
+import { useAuth } from "@/lib/auth"
+import { ApiError } from "@/lib/api"
 
-const roleEmail = (r: Role) => (r === "operator" ? "ops@craftling.gg" : "anya@craftling.gg")
+type Mode = "login" | "register"
 
 export function AuthScreen({
-  onSignIn,
   theme,
   toggleTheme,
 }: {
-  onSignIn: (role: Role) => void
   theme: "dark" | "light"
   toggleTheme: () => void
 }) {
-  const [role, setRole] = useState<Role>("operator")
-  const [email, setEmail] = useState(roleEmail("operator"))
-  const [pw, setPw] = useState("••••••••••")
+  const { login, register } = useAuth()
+  const [mode, setMode] = useState<Mode>("login")
+  const [email, setEmail] = useState("")
+  const [pw, setPw] = useState("")
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
-  // Switching role swaps in that role's demo email (keeps any manual edit otherwise).
-  const pickRole = (r: Role) => {
-    setRole(r)
-    setEmail(roleEmail(r))
-  }
-
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    setError(null)
     setBusy(true)
-    setTimeout(() => onSignIn(role), 620)
+    try {
+      if (mode === "register") await register(email.trim(), pw)
+      else await login(email.trim(), pw)
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : "Couldn't reach the control plane. Is the server running?"
+      )
+      setBusy(false)
+    }
   }
 
   return (
@@ -84,13 +90,8 @@ export function AuthScreen({
           style={{ gap: 14, alignItems: "center", textAlign: "center" }}
         >
           <Voxel className="lg" />
-          <div className="col" style={{ gap: 5 }}>
-            <div style={{ fontSize: 25, fontWeight: 700, letterSpacing: "-0.02em" }}>
-              Craftling
-            </div>
-            <div className="muted t-sm">
-              Firecracker microVM hosting · control plane
-            </div>
+          <div style={{ fontSize: 25, fontWeight: 700, letterSpacing: "-0.02em" }}>
+            Craftling
           </div>
         </div>
 
@@ -102,19 +103,25 @@ export function AuthScreen({
           <div className="seg" style={{ width: "100%" }}>
             <button
               type="button"
-              className={role === "operator" ? "on" : ""}
+              className={mode === "login" ? "on" : ""}
               style={{ flex: 1, justifyContent: "center" }}
-              onClick={() => pickRole("operator")}
+              onClick={() => {
+                setMode("login")
+                setError(null)
+              }}
             >
-              <Icon name="shield" /> Operator
+              <Icon name="shield" /> Sign in
             </button>
             <button
               type="button"
-              className={role === "owner" ? "on" : ""}
+              className={mode === "register" ? "on" : ""}
               style={{ flex: 1, justifyContent: "center" }}
-              onClick={() => pickRole("owner")}
+              onClick={() => {
+                setMode("register")
+                setError(null)
+              }}
             >
-              <Icon name="user" /> Owner
+              <Icon name="user" /> Create account
             </button>
           </div>
 
@@ -125,53 +132,58 @@ export function AuthScreen({
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@craftling.gg"
               autoComplete="username"
+              required
             />
           </div>
           <div className="field">
             <div className="between">
               <label className="label">Password</label>
-              <a
-                className="t-xs"
-                style={{
-                  color: "var(--primary)",
-                  textDecoration: "none",
-                  fontWeight: 540,
-                }}
-                href="#"
-                onClick={(e) => e.preventDefault()}
-              >
-                Forgot?
-              </a>
+              {mode === "register" && (
+                <span className="t-xs muted">Min 8 characters</span>
+              )}
             </div>
             <input
               className="input"
               type="password"
               value={pw}
               onChange={(e) => setPw(e.target.value)}
-              autoComplete="current-password"
+              placeholder="••••••••••"
+              autoComplete={mode === "register" ? "new-password" : "current-password"}
+              minLength={8}
+              required
             />
           </div>
+
+          {error && (
+            <div
+              className="row gap-2 t-sm"
+              style={{
+                color: "var(--danger-fg)",
+                background: "color-mix(in oklab, var(--danger) 10%, transparent)",
+                padding: "9px 11px",
+                borderRadius: "var(--radius)",
+                alignItems: "flex-start",
+              }}
+            >
+              <Icon name="alert" size={15} style={{ marginTop: 1, flex: "none" }} />
+              <span>{error}</span>
+            </div>
+          )}
 
           <Btn variant="primary" size="lg" type="submit" className="block" disabled={busy}>
             {busy ? (
               <>
-                <Icon name="restart" className="spin" size={16} /> Signing in…
+                <Icon name="restart" className="spin" size={16} />{" "}
+                {mode === "register" ? "Creating account…" : "Signing in…"}
               </>
+            ) : mode === "register" ? (
+              <>Create account</>
             ) : (
               <>Sign in</>
             )}
           </Btn>
-
-          <div className="t-xs muted" style={{ textAlign: "center", lineHeight: 1.6 }}>
-            Demo ·{" "}
-            <b style={{ color: "var(--foreground)" }}>
-              {role === "operator" ? "Operator" : "Owner"}
-            </b>{" "}
-            sees{" "}
-            {role === "operator" ? "the whole fleet" : "only their own servers"}. JWT +
-            rotating refresh tokens.
-          </div>
         </form>
 
         <div

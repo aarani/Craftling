@@ -1,9 +1,10 @@
-/* app-shell.tsx — sidebar + topbar. Role-gated nav. */
+/* app-shell.tsx — sidebar + topbar. Role-gated nav, real session identity. */
 /* eslint-disable react-refresh/only-export-components */
 import type { ReactNode } from "react"
 import { Icon, Voxel, type IconName } from "./icon"
 import { Menu } from "./primitives"
-import { ZONES, ownerById, type Role } from "@/lib/data"
+import { useAuth } from "@/lib/auth"
+import type { Role } from "@/lib/data"
 
 export type Route =
   | "servers"
@@ -41,6 +42,12 @@ export const NAV: { group: string; items: NavItem[] }[] = [
     items: [{ id: "settings", label: "Settings", icon: "settings", roles: ["operator", "owner"] }],
   },
 ]
+
+/** First two alphanumerics of the email local-part, e.g. anya@… → "AN". */
+function initialsOf(email: string): string {
+  const local = email.split("@")[0].replace(/[^a-z0-9]/gi, "")
+  return (local.slice(0, 2) || "??").toUpperCase()
+}
 
 function Sidebar({
   route,
@@ -115,31 +122,25 @@ function Sidebar({
 function Topbar({
   route,
   role,
-  setRole,
   theme,
   toggleTheme,
-  onSignOut,
-  zone,
-  setZone,
 }: {
   route: Route
   role: Role
-  setRole: (r: Role) => void
   theme: "dark" | "light"
   toggleTheme: () => void
-  onSignOut: () => void
-  zone: string
-  setZone: (z: string) => void
 }) {
+  const { user, logout } = useAuth()
   const titles: Record<Route, string> = {
-    servers: "Game Servers",
+    servers: role === "owner" ? "My Servers" : "Game Servers",
     hosts: "Host Fleet",
     scheduler: "Scheduler",
     observability: "Observability",
     quotas: "Quotas & Users",
     settings: "Settings",
   }
-  const owner = ownerById("u-anya")!
+  const email = user?.email ?? ""
+  const initials = email ? initialsOf(email) : "??"
   return (
     <header className="topbar">
       <div className="row gap-2">
@@ -147,34 +148,6 @@ function Topbar({
       </div>
 
       <div className="grow" />
-
-      {role === "operator" && (
-        <Menu
-          align="right"
-          width={190}
-          trigger={(_open, t) => (
-            <button className="chip" onClick={t}>
-              <Icon name="globe" size={14} /> {zone === "all" ? "All zones" : zone}{" "}
-              <Icon name="chevDown" size={13} />
-            </button>
-          )}
-        >
-          <div className="menu-label">Zone filter</div>
-          {["all", ...ZONES].map((z) => (
-            <div key={z} className="menu-item" onClick={() => setZone(z)}>
-              <Icon name="pin" />
-              {z === "all" ? "All zones" : z}
-              {zone === z && (
-                <Icon
-                  name="check"
-                  size={14}
-                  style={{ marginLeft: "auto", color: "var(--primary)" }}
-                />
-              )}
-            </div>
-          ))}
-        </Menu>
-      )}
 
       <div className="input-wrap" style={{ width: 200 }}>
         <Icon name="search" />
@@ -189,17 +162,19 @@ function Topbar({
 
       <Menu
         align="right"
-        width={230}
+        width={240}
         trigger={(_open, t) => (
           <button
             className="row gap-2"
             onClick={t}
             style={{ background: "none", border: "none", cursor: "pointer", padding: 2 }}
           >
-            <div className="avatar">{role === "operator" ? "OP" : owner.initials}</div>
+            <div className="avatar">{initials}</div>
             <div className="col" style={{ gap: 0, alignItems: "flex-start" }}>
-              <span className="t-sm semibold" style={{ lineHeight: 1.2 }}>
-                {role === "operator" ? "Ops Console" : owner.name}
+              <span className="t-sm semibold" style={{ lineHeight: 1.2, maxWidth: 150 }}>
+                <span className="truncate" style={{ display: "block" }}>
+                  {email}
+                </span>
               </span>
               <span className="t-xs muted" style={{ lineHeight: 1.2 }}>
                 {role === "operator" ? "Operator · admin" : "Owner"}
@@ -209,30 +184,12 @@ function Topbar({
           </button>
         )}
       >
-        <div className="menu-label">Demo · switch role</div>
-        <div className="menu-item" onClick={() => setRole("operator")}>
-          <Icon name="shield" /> Operator{" "}
-          <span className="muted t-xs" style={{ marginLeft: "auto" }}>
-            fleet-wide
-          </span>
-          {role === "operator" && (
-            <Icon name="check" size={14} style={{ color: "var(--primary)" }} />
-          )}
-        </div>
-        <div className="menu-item" onClick={() => setRole("owner")}>
-          <Icon name="user" /> Owner{" "}
-          <span className="muted t-xs" style={{ marginLeft: "auto" }}>
-            owner-scoped
-          </span>
-          {role === "owner" && (
-            <Icon name="check" size={14} style={{ color: "var(--primary)" }} />
-          )}
-        </div>
-        <div className="menu-sep" />
+        <div className="menu-label">{email}</div>
         <div className="menu-item">
           <Icon name="user" /> Account settings
         </div>
-        <div className="menu-item danger" onClick={onSignOut}>
+        <div className="menu-sep" />
+        <div className="menu-item danger" onClick={logout}>
           <Icon name="logout" /> Sign out
         </div>
       </Menu>
@@ -245,40 +202,23 @@ export function AppShell({
   route,
   setRoute,
   role,
-  setRole,
   theme,
   toggleTheme,
-  onSignOut,
   counts,
-  zone,
-  setZone,
 }: {
   children: ReactNode
   route: Route
   setRoute: (r: Route) => void
   role: Role
-  setRole: (r: Role) => void
   theme: "dark" | "light"
   toggleTheme: () => void
-  onSignOut: () => void
   counts: Partial<Record<Route, number>>
-  zone: string
-  setZone: (z: string) => void
 }) {
   return (
     <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
       <Sidebar route={route} setRoute={setRoute} role={role} counts={counts} />
       <div className="col" style={{ flex: 1, minWidth: 0 }}>
-        <Topbar
-          route={route}
-          role={role}
-          setRole={setRole}
-          theme={theme}
-          toggleTheme={toggleTheme}
-          onSignOut={onSignOut}
-          zone={zone}
-          setZone={setZone}
-        />
+        <Topbar route={route} role={role} theme={theme} toggleTheme={toggleTheme} />
         <div className="page">{children}</div>
       </div>
     </div>

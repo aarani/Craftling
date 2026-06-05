@@ -5,12 +5,9 @@ import { Btn, CopyBtn, StatusBadge } from "./primitives"
 import { SIZES, MAX_HOST_CPU, MAX_HOST_MEM } from "./servers-shared"
 import {
   MC_VERSIONS,
-  OWNERS,
   fmtMem,
   fmtWorld,
-  hostById,
-  ownerById,
-  type Role,
+  type Owner,
   type Server,
   type ServerStatus,
 } from "@/lib/data"
@@ -20,8 +17,6 @@ export interface CreateSpec {
   version: string
   cpus: number
   mem: number
-  maxPlayers: number
-  owner: string
 }
 
 function Row2({ k, children }: { k: string; children: ReactNode }) {
@@ -45,6 +40,7 @@ const CAN_STOP: ServerStatus[] = ["running", "starting", "provisioning"]
 export function ServerDrawer({
   s,
   isOwner,
+  owner,
   onClose,
   onStart,
   onStop,
@@ -53,14 +49,13 @@ export function ServerDrawer({
 }: {
   s: Server
   isOwner: boolean
+  owner?: Owner | null
   onClose: () => void
   onStart: () => void
   onStop: () => void
   onRestart: () => void
   onDelete: () => void
 }) {
-  const host = hostById(s.hostId)
-  const owner = ownerById(s.owner)
   const transitioning = TRANSITIONING.includes(s.status)
   const canStart = CAN_START.includes(s.status)
   const canStop = CAN_STOP.includes(s.status)
@@ -241,9 +236,12 @@ export function ServerDrawer({
               </Row2>
             )}
             <Row2 k="Host">
-              {host ? <span className="mono">{host.hostname}</span> : <span className="muted">unplaced</span>}
+              {s.address ? (
+                <span className="mono">{s.address}</span>
+              ) : (
+                <span className="muted">unplaced</span>
+              )}
             </Row2>
-            <Row2 k="Zone">{host ? host.zone : "—"}</Row2>
             <Row2 k="vCPU / Memory">
               <span className="mono">
                 {s.cpus} vCPU · {fmtMem(s.mem)}
@@ -273,7 +271,7 @@ export function ServerDrawer({
               )}
             </Row2>
             <Row2 k="Players">
-              {s.status === "running" ? (
+              {s.status === "running" && s.maxPlayers > 0 ? (
                 <span className="mono">
                   {s.players} / {s.maxPlayers}
                 </span>
@@ -282,14 +280,7 @@ export function ServerDrawer({
               )}
             </Row2>
             <Row2 k="Health (RCON)">
-              {s.status === "running" ? (
-                <span className="badge soft s-running">
-                  <i className="dot" />
-                  healthy
-                </span>
-              ) : (
-                <span className="muted">—</span>
-              )}
+              <span className="muted">—</span>
             </Row2>
           </div>
 
@@ -335,19 +326,15 @@ export function ServerDrawer({
 }
 
 export function CreateDrawer({
-  role,
   onClose,
   onCreate,
 }: {
-  role: Role
   onClose: () => void
   onCreate: (spec: CreateSpec) => void
 }) {
   const [name, setName] = useState("")
   const [version, setVersion] = useState(MC_VERSIONS[1])
   const [size, setSize] = useState("medium")
-  const [owner, setOwner] = useState("u-anya")
-  const [maxPlayers, setMaxPlayers] = useState(20)
   const sz = SIZES.find((x) => x.id === size)!
   const oversize = sz.cpus > MAX_HOST_CPU || sz.mem > MAX_HOST_MEM
   const valid = name.trim().length >= 3
@@ -359,8 +346,6 @@ export function CreateDrawer({
       version,
       cpus: sz.cpus,
       mem: sz.mem,
-      maxPlayers,
-      owner,
     })
   }
 
@@ -393,60 +378,27 @@ export function CreateDrawer({
             <span className="t-xs muted">Lowercase, hyphenated. Min 3 characters.</span>
           </div>
 
-          <div className="row gap-3">
-            <div className="field grow">
-              <label className="label">Minecraft version</label>
-              <div className="input-wrap">
-                <select
-                  className="select"
-                  value={version}
-                  onChange={(e) => setVersion(e.target.value)}
-                >
-                  {MC_VERSIONS.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
-                    </option>
-                  ))}
-                </select>
-                <Icon
-                  name="chevDown"
-                  size={14}
-                  style={{ position: "absolute", right: 10, left: "auto", color: "var(--muted-foreground)" }}
-                />
-              </div>
-            </div>
-            <div className="field" style={{ width: 120 }}>
-              <label className="label">Max players</label>
-              <input
-                className="input mono"
-                type="number"
-                min={1}
-                max={200}
-                value={maxPlayers}
-                onChange={(e) => setMaxPlayers(+e.target.value)}
+          <div className="field">
+            <label className="label">Minecraft version</label>
+            <div className="input-wrap">
+              <select
+                className="select"
+                value={version}
+                onChange={(e) => setVersion(e.target.value)}
+              >
+                {MC_VERSIONS.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+              <Icon
+                name="chevDown"
+                size={14}
+                style={{ position: "absolute", right: 10, left: "auto", color: "var(--muted-foreground)" }}
               />
             </div>
           </div>
-
-          {role === "operator" && (
-            <div className="field">
-              <label className="label">Owner</label>
-              <div className="input-wrap">
-                <select className="select" value={owner} onChange={(e) => setOwner(e.target.value)}>
-                  {OWNERS.map((o) => (
-                    <option key={o.id} value={o.id}>
-                      {o.name} · {o.email}
-                    </option>
-                  ))}
-                </select>
-                <Icon
-                  name="chevDown"
-                  size={14}
-                  style={{ position: "absolute", right: 10, left: "auto", color: "var(--muted-foreground)" }}
-                />
-              </div>
-            </div>
-          )}
 
           <div className="field">
             <label className="label">Size</label>
