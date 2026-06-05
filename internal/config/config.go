@@ -5,8 +5,18 @@ import (
 	"time"
 )
 
+// Process modes. The control plane runs as ModeServer; host workers will run
+// as ModeAgent once the binary is split (P3). Today only the server exists.
+const (
+	ModeServer = "server"
+	ModeAgent  = "agent"
+)
+
 // Config holds runtime configuration sourced from environment variables.
 type Config struct {
+	// Mode selects which role this process runs as: "server" (control plane)
+	// or "agent" (host worker).
+	Mode        string
 	Port        string
 	Env         string
 	DatabaseURL string
@@ -22,6 +32,7 @@ type Config struct {
 // Load reads configuration from the environment, applying sensible defaults.
 func Load() *Config {
 	return &Config{
+		Mode:        getEnv("MODE", ModeServer),
 		Port:        getEnv("PORT", "8080"),
 		Env:         getEnv("APP_ENV", "development"),
 		DatabaseURL: getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/craftling?sslmode=disable"),

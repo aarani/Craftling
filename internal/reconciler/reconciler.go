@@ -80,13 +80,24 @@ func (r *Reconciler) start(ctx context.Context, s *model.GameServer) error {
 	if err := r.servers.MarkStatus(ctx, s.ID, model.StatusProvisioning, ""); err != nil {
 		return err
 	}
-	inst, err := r.prov.Provision(ctx, s)
+	// A server that already has a VM was provisioned before and merely stopped;
+	// resume it rather than creating a fresh one.
+	provisioned := s.VMID != nil && *s.VMID != ""
+	inst, err := r.provisionOrStart(ctx, s, provisioned)
 	if err != nil {
 		return err
 	}
-	r.log.Info("server provisioned",
-		zap.String("id", s.ID), zap.String("vm_id", inst.VMID))
+	r.log.Info("server running",
+		zap.String("id", s.ID), zap.String("vm_id", inst.VMID), zap.Bool("resumed", provisioned))
 	return r.servers.MarkRunning(ctx, s.ID, inst.VMID, inst.Host, inst.Port)
+}
+
+// provisionOrStart resumes an existing VM or provisions a new one.
+func (r *Reconciler) provisionOrStart(ctx context.Context, s *model.GameServer, provisioned bool) (*provisioner.Instance, error) {
+	if provisioned {
+		return r.prov.Start(ctx, s)
+	}
+	return r.prov.Provision(ctx, s)
 }
 
 func (r *Reconciler) stop(ctx context.Context, s *model.GameServer) error {
@@ -96,7 +107,9 @@ func (r *Reconciler) stop(ctx context.Context, s *model.GameServer) error {
 	if err := r.servers.MarkStatus(ctx, s.ID, model.StatusStopping, ""); err != nil {
 		return err
 	}
-	if err := r.prov.Deprovision(ctx, s); err != nil {
+	// Halt the VM but keep it; the world and runtime details survive for a later
+	// start. Destruction only happens on delete.
+	if err := r.prov.Stop(ctx, s); err != nil {
 		return err
 	}
 	r.log.Info("server stopped", zap.String("id", s.ID))

@@ -21,6 +21,8 @@ This document is the phased plan to get there. Each milestone lists its goal, wh
 
 Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconciler (2s) + token reaper; `Provisioner` interface with `Fake`; e2e suite (testcontainers) + CI; multi-stage Dockerfile.
 
+**P0 done:** goose migrations (`internal/db/migrations`, applied on startup, clean on fresh + pre-existing DBs); `Provisioner` extended with `Start`/`Stop`/`Status` (stopped ≠ destroyed); `Mode` (`server`/`agent`) in `internal/config`.
+
 ---
 
 ## P0 — Foundations (no behavior change)

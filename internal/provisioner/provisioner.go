@@ -17,12 +17,36 @@ type Instance struct {
 	Port int
 }
 
-// Provisioner creates and destroys the compute backing a game server.
+// State is the observed lifecycle state of a backing instance, as reported by
+// Status. It distinguishes a stopped-but-present VM from one that is gone.
+type State string
+
+const (
+	// StateRunning means the backing VM exists and is running.
+	StateRunning State = "running"
+	// StateStopped means the backing VM exists but is halted (not destroyed).
+	StateStopped State = "stopped"
+	// StateMissing means there is no backing VM.
+	StateMissing State = "missing"
+)
+
+// Provisioner manages the compute backing a game server. A server's VM has a
+// lifecycle independent of its existence: Provision/Deprovision create and
+// destroy it, while Start/Stop toggle a provisioned VM between running and
+// stopped — so a *stopped* server keeps its VM (and, later, its disk) rather
+// than being torn down.
 type Provisioner interface {
-	// Provision brings up the backing VM and returns its runtime details.
+	// Provision creates the backing VM and boots it, returning runtime details.
 	Provision(ctx context.Context, s *model.GameServer) (*Instance, error)
+	// Start boots an already-provisioned but stopped VM, returning its runtime
+	// details. It must be idempotent for an already-running VM.
+	Start(ctx context.Context, s *model.GameServer) (*Instance, error)
+	// Stop halts the backing VM without destroying it. It must be idempotent.
+	Stop(ctx context.Context, s *model.GameServer) error
 	// Deprovision tears down the backing VM. It must be idempotent.
 	Deprovision(ctx context.Context, s *model.GameServer) error
+	// Status reports the observed state of the backing VM.
+	Status(ctx context.Context, s *model.GameServer) (State, error)
 }
 
 // defaultMinecraftPort is the standard Minecraft server port.
@@ -44,5 +68,33 @@ func (Fake) Provision(_ context.Context, _ *model.GameServer) (*Instance, error)
 	}, nil
 }
 
+// Start resumes a previously provisioned server, reusing its recorded runtime
+// details. If the server was never provisioned it synthesizes new ones.
+func (f Fake) Start(ctx context.Context, s *model.GameServer) (*Instance, error) {
+	if s.VMID == nil || *s.VMID == "" {
+		return f.Provision(ctx, s)
+	}
+	inst := &Instance{VMID: *s.VMID, Host: "127.0.0.1", Port: defaultMinecraftPort}
+	if s.Host != nil {
+		inst.Host = *s.Host
+	}
+	if s.Port != nil {
+		inst.Port = *s.Port
+	}
+	return inst, nil
+}
+
+// Stop is a no-op for the fake backend; the VM is considered halted but kept.
+func (Fake) Stop(_ context.Context, _ *model.GameServer) error { return nil }
+
 // Deprovision is a no-op for the fake backend.
 func (Fake) Deprovision(_ context.Context, _ *model.GameServer) error { return nil }
+
+// Status infers state from the server's recorded VM id, since the fake holds no
+// real backend state: a server with a VM is running, otherwise it is missing.
+func (Fake) Status(_ context.Context, s *model.GameServer) (State, error) {
+	if s.VMID != nil && *s.VMID != "" {
+		return StateRunning, nil
+	}
+	return StateMissing, nil
+}

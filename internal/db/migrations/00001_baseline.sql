@@ -1,3 +1,8 @@
+-- Baseline schema. Written idempotently (IF NOT EXISTS) so it applies cleanly
+-- both to fresh databases and to ones created before goose was adopted, where
+-- these tables already exist from the old apply-on-startup schema.
+
+-- +goose Up
 CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
     email         TEXT NOT NULL UNIQUE,
@@ -43,3 +48,8 @@ CREATE TABLE IF NOT EXISTS game_servers (
 ALTER TABLE game_servers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_game_servers_owner_id ON game_servers (owner_id);
+
+-- +goose Down
+DROP TABLE IF EXISTS game_servers;
+DROP TABLE IF EXISTS refresh_tokens;
+DROP TABLE IF EXISTS users;
