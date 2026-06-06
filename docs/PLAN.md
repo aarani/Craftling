@@ -23,6 +23,8 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 
 **P0 done:** goose migrations (`internal/db/migrations`, applied on startup, clean on fresh + pre-existing DBs); `Provisioner` extended with `Start`/`Stop`/`Status` (stopped ≠ destroyed); `Mode` (`server`/`agent`) in `internal/config`.
 
+**P1 done:** `model.Host` + **in-memory** `HostRepository` (`internal/repository/host.go`, concurrency-safe map — no durable table yet); agent endpoints `POST /api/v1/agent/hosts/register` + `POST /api/v1/agent/hosts/:id/heartbeat` behind a placeholder `middleware.AgentAuth` seam; admin fleet view `GET /api/v1/admin/hosts`; host reaper (`reaper.Hosts`, 30s TTL / 10s sweep) marks stale hosts `down`, heartbeat recovers them to `ready`. **Identity is agent-owned**, not control-plane-assigned: register accepts an optional agent-supplied `id` (authoritative key on upsert), so a host keeps its id across a control-plane restart even though the fleet lives only in memory — this is why no `hosts` table is needed yet. e2e covers register → heartbeat → stale → `down` → recover, plus agent-supplied-id stability.
+
 ---
 
 ## P0 — Foundations (no behavior change)
@@ -36,24 +38,25 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 - **New code:** `internal/db/migrations/*.sql`; migration runner.
 - **Verify:** existing e2e stays green; migrations apply cleanly on both fresh and pre-existing DBs.
 
-## P1 — Host fleet
+## P1 — Host fleet ✅
 
 - **Goal:** model the pool of worker hosts.
 - **Why:** scheduling and every compute action target a host; need an inventory + liveness first.
 - **Steps:**
-  - `hosts` table: `id, hostname, address, zone, cpus_total, memory_mb_total, cpus_allocatable, memory_mb_allocatable, status (ready|draining|down), agent_version, last_heartbeat_at, timestamps`.
-  - `internal/repository/host.go` (`HostRepository`): upsert-register, heartbeat, list-ready, capacity queries, mark-down.
+  - ~~`hosts` table~~ → **in-memory `HostRepository`** holding the same fields (`id, hostname, address, zone, cpus_total, memory_mb_total, cpus_allocatable, memory_mb_allocatable, status (ready|draining|down), agent_version, last_heartbeat_at, timestamps`). The fleet is reconstructable from live heartbeats, so no durable table is required at this phase; the repo's method set is DB-shaped so a Postgres store can slot in later unchanged.
+  - `internal/repository/host.go` (`HostRepository`): upsert-register, heartbeat, get, list, list-ready (capacity-query seam for P2), mark-stale.
   - Agent-facing endpoints: `POST /api/v1/agent/hosts/register`, `POST /api/v1/agent/hosts/:id/heartbeat` (agent auth is a placeholder now; hardened in P10).
-  - Host reaper (reuse `internal/reaper` pattern): mark hosts `down` when heartbeat goes stale.
+  - Host reaper (reuse `internal/reaper` pattern): mark hosts `down` when heartbeat goes stale; a later heartbeat recovers a host to `ready`.
+  - **Identity (decision):** *agent-owned ids* — register accepts an optional agent-supplied `id`, the authoritative upsert key. A host keeps its id across a control-plane restart (the agent re-registers with the same id), so future `game_servers.host_id` references survive restarts without persisting the fleet. A durable `hosts` table is only needed later if we want declarative inventory (remembering a host that is `down` *and* silent).
   - **Comms model (decision):** *control-plane-authoritative hybrid* — agents push status up via heartbeat; the control plane enacts desired state by calling **down** to agents (P3).
-- **New code:** `hosts` table, `HostRepository`, agent host handlers, host reaper.
-- **Verify:** e2e — register host → heartbeat → stale → `down`.
+- **New code:** `model.Host`, in-memory `HostRepository`, agent host handlers, `middleware.AgentAuth` placeholder, host reaper, admin `GET /api/v1/admin/hosts`.
+- **Verify:** e2e — register host → heartbeat → stale → `down` → recover; agent-supplied-id stability. ✅
 
 ## P2 — Scheduler / placement
 
 - **Goal:** assign each unplaced server to a host with capacity.
 - **Steps:**
-  - Add `host_id` (nullable FK) to `game_servers`; add an `unschedulable` signal (status + `status_message`).
+  - Add `host_id` to `game_servers` (nullable; a plain id column, **not** a DB FK while the fleet is in-memory — referential integrity is the scheduler's job); add an `unschedulable` signal (status + `status_message`). Relies on P1's agent-owned ids staying stable across restarts.
   - `internal/scheduler`: pick a `ready` host with enough allocatable cpu/mem (least-loaded/first-fit); **reserve capacity atomically** (transaction).
   - Reconciler: if a `running`-desired server has no `host_id`, call the scheduler; if nothing fits, mark `unschedulable` and retry next tick.
   - Create-time validation: reject specs larger than any host can ever fit.

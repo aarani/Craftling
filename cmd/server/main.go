@@ -26,6 +26,11 @@ const (
 	reapInterval = time.Hour
 	// reconcileInterval is how often game servers are reconciled.
 	reconcileInterval = 2 * time.Second
+	// hostReapInterval is how often the fleet is swept for stale hosts.
+	hostReapInterval = 10 * time.Second
+	// hostHeartbeatTTL is how long a host may go without heartbeating before it
+	// is marked down.
+	hostHeartbeatTTL = 30 * time.Second
 )
 
 func main() {
@@ -59,7 +64,11 @@ func main() {
 	}
 	dbCancel()
 
-	router := handler.NewRouter(cfg, zlog, pool)
+	// The fleet inventory lives in process memory (P1). It is shared between the
+	// HTTP handlers (register/heartbeat) and the host reaper.
+	hostRepo := repository.NewHostRepository()
+
+	router := handler.NewRouter(cfg, zlog, pool, hostRepo)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -76,6 +85,9 @@ func main() {
 
 	// Periodically purge expired refresh tokens.
 	go reaper.RefreshTokens(ctx, zlog, repository.NewRefreshTokenRepository(pool), reapInterval)
+
+	// Periodically mark hosts down once their heartbeats go stale.
+	go reaper.Hosts(ctx, zlog, hostRepo, hostReapInterval, hostHeartbeatTTL)
 
 	// Continuously reconcile game servers toward their desired state.
 	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), zlog)

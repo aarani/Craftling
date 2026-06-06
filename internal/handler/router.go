@@ -11,8 +11,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// NewRouter builds the Gin engine with middleware and routes wired up.
-func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool) *gin.Engine {
+// NewRouter builds the Gin engine with middleware and routes wired up. The host
+// inventory is passed in (rather than built here) so the host reaper can share
+// the same in-memory store.
+func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool, hostRepo *repository.HostRepository) *gin.Engine {
 	if cfg.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -22,8 +24,9 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool) *gin.Eng
 	refreshRepo := repository.NewRefreshTokenRepository(pool)
 	gameServerRepo := repository.NewGameServerRepository(pool)
 	authHandler := NewAuthHandler(userRepo, refreshRepo, jwtManager, cfg.RefreshTTL)
-	adminHandler := NewAdminHandler(userRepo, gameServerRepo)
+	adminHandler := NewAdminHandler(userRepo, gameServerRepo, hostRepo)
 	serverHandler := NewServerHandler(gameServerRepo)
+	agentHandler := NewAgentHandler(hostRepo)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -64,6 +67,16 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool) *gin.Eng
 		{
 			admin.GET("/users", adminHandler.ListUsers)
 			admin.GET("/servers", adminHandler.ListServers)
+			admin.GET("/hosts", adminHandler.ListHosts)
+		}
+
+		// Agent-facing routes. Hosts register and heartbeat here. Auth is a
+		// placeholder until P10 (per-host tokens / mTLS).
+		agent := api.Group("/agent")
+		agent.Use(middleware.AgentAuth())
+		{
+			agent.POST("/hosts/register", agentHandler.Register)
+			agent.POST("/hosts/:id/heartbeat", agentHandler.Heartbeat)
 		}
 	}
 

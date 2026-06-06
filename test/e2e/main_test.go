@@ -18,6 +18,7 @@ import (
 	"github.com/aarani/craftling-go/internal/db"
 	"github.com/aarani/craftling-go/internal/handler"
 	"github.com/aarani/craftling-go/internal/provisioner"
+	"github.com/aarani/craftling-go/internal/reaper"
 	"github.com/aarani/craftling-go/internal/reconciler"
 	"github.com/aarani/craftling-go/internal/repository"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,8 +30,14 @@ import (
 
 // Shared test fixtures, set up in TestMain.
 var (
-	baseURL string         // address of the test HTTP server
-	pool    *pgxpool.Pool  // direct DB access for integration assertions
+	baseURL string        // address of the test HTTP server
+	pool    *pgxpool.Pool // direct DB access for integration assertions
+)
+
+// Host-reaper timing for tests: short so the stale->down transition is quick.
+const (
+	hostHeartbeatTTL = 200 * time.Millisecond
+	hostReapInterval = 25 * time.Millisecond
 )
 
 func TestMain(m *testing.M) {
@@ -73,13 +80,17 @@ func TestMain(m *testing.M) {
 		AccessTTL:  time.Hour,
 		RefreshTTL: time.Hour,
 	}
-	srv := httptest.NewServer(handler.NewRouter(cfg, zap.NewNop(), pool))
+	hostRepo := repository.NewHostRepository()
+	srv := httptest.NewServer(handler.NewRouter(cfg, zap.NewNop(), pool, hostRepo))
 	baseURL = srv.URL
 
 	// Run the reconciler with a fast tick so lifecycle tests converge quickly.
 	recCtx, recCancel := context.WithCancel(ctx)
 	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), zap.NewNop())
 	go rec.Run(recCtx, 100*time.Millisecond)
+
+	// Run the host reaper with short timing so the stale->down test converges.
+	go reaper.Hosts(recCtx, zap.NewNop(), hostRepo, hostReapInterval, hostHeartbeatTTL)
 
 	code := m.Run()
 
