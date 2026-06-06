@@ -118,10 +118,21 @@ set by the API) from **observed status** (`pending` → `provisioning` →
 status doesn't match their desired state, and drives them one step at a time
 via a `Provisioner` backend.
 
-The current backend is `provisioner.Fake`, which simulates VM provisioning
-(assigns a synthetic `vm_id` and `host:25565`). Real microVM provisioning
-(Firecracker / Cloud Hypervisor) drops in by implementing the same
-`Provisioner` interface — the API and reconciler are unchanged.
+**Placement (P2).** Before a server can run it must be placed on a fleet host.
+The `internal/scheduler` picks a `ready` host with enough allocatable cpu/memory
+(least-loaded) and **atomically reserves** that capacity; the assignment is
+recorded as `game_servers.host_id`. A server that fits no host right now is
+marked `unschedulable` and retried; a spec larger than any host is rejected at
+create time.
+
+**Agent split (P3).** The control plane never touches KVM. The reconciler's
+backend is `provisioner.RemoteProvisioner`, which resolves the assigned host's
+address and calls that host's **agent** (`cmd/agent` / `internal/agent`) over
+HTTP to provision/start/stop/deprovision the VM. The agent runs a `Runtime`;
+today that's the in-memory `FakeRuntime` (synthetic `vm_id`, `host:25565`), and a
+real Firecracker driver (P4) drops in behind the same interface — the API and
+reconciler are unchanged. Agents register and heartbeat with the control plane
+so the scheduler knows the fleet.
 
 ```bash
 # Create a server (desired_state defaults to running)
@@ -148,25 +159,32 @@ history/audit but hidden from every API read (and from reconciliation).
 ## Layout
 
 ```
-cmd/server          entry point, DB connect/migrate + graceful shutdown
-internal/config     environment configuration
-internal/db         pgx pool + embedded schema/migration
-internal/model      domain types (User)
-internal/repository Postgres-backed data access
+cmd/server          control-plane entry point, DB connect/migrate + graceful shutdown
+cmd/agent           host-worker entry point: VM API + register/heartbeat (P3)
+internal/config     environment configuration (incl. agent config)
+internal/db         pgx pool + embedded migrations
+internal/model      domain types (User, GameServer, Host)
+internal/repository data access (Postgres; in-memory host inventory)
 internal/auth       bcrypt password hashing + JWT issue/verify
-internal/handler    routes and request handlers (incl. auth)
-internal/middleware request ID, request logging, JWT auth guard
+internal/handler    control-plane routes and request handlers
+internal/middleware request ID, request logging, JWT/agent auth guards
+internal/scheduler  host placement + capacity reservation (P2)
+internal/reconciler desired-state → observed-status convergence loop
+internal/provisioner Provisioner seam: Fake + RemoteProvisioner (P3)
+internal/agent      host agent: Runtime/FakeRuntime, VM API server, clients (P3)
 ```
 
 ## Commands
 
 ```bash
-make run       # run the server
-make build     # build binary to ./bin/server
-make test      # run unit tests
-make test-e2e  # run end-to-end tests (requires Docker)
-make tidy      # tidy go.mod
-make fmt       # format code
+make run         # run the control plane
+make run-agent   # run a host agent (MODE=agent; see Makefile for env)
+make build       # build control plane to ./bin/server
+make build-agent # build agent to ./bin/agent
+make test        # run unit tests
+make test-e2e    # run end-to-end tests (requires Docker)
+make tidy        # tidy go.mod
+make fmt         # format code
 ```
 
 ## Testing

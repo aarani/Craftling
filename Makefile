@@ -1,10 +1,18 @@
-.PHONY: run build test test-e2e tidy fmt
+.PHONY: run run-agent build build-agent test test-e2e tidy fmt
 
 run:
 	go run ./cmd/server
 
+# Run a host agent (P3). Defaults target a local control plane; override via env,
+# e.g. MODE=agent CONTROL_PLANE_URL=... ADVERTISE_ADDR=... PORT=9000.
+run-agent:
+	MODE=agent go run ./cmd/agent
+
 build:
 	go build -o bin/server ./cmd/server
+
+build-agent:
+	go build -o bin/agent ./cmd/agent
 
 test:
 	go test ./...

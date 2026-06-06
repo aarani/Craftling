@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -27,6 +28,32 @@ type Config struct {
 	// Optional admin bootstrap; when both are set, the admin is seeded on startup.
 	AdminEmail    string
 	AdminPassword string
+
+	// Agent configuration (ModeAgent only). The host worker registers with the
+	// control plane and exposes its VM API for the control plane to call back.
+	Agent AgentConfig
+}
+
+// AgentConfig holds the host-worker settings used when Mode == ModeAgent.
+type AgentConfig struct {
+	// ControlPlaneURL is where the agent registers and heartbeats.
+	ControlPlaneURL string
+	// ID is this agent's stable, self-owned host id (kept across CP restarts).
+	ID string
+	// Hostname identifies the host in the fleet view.
+	Hostname string
+	// AdvertiseAddr is the agent's own API address the control plane calls back
+	// (host:port reachable from the control plane).
+	AdvertiseAddr string
+	// AdvertiseHost is the player-facing connect address VMs report.
+	AdvertiseHost string
+	// Zone is an optional placement/locality label.
+	Zone string
+	// Version is reported to the control plane on register.
+	Version string
+	// CPUsTotal / MemoryMBTotal advertise this host's capacity to the scheduler.
+	CPUsTotal     int
+	MemoryMBTotal int
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -42,12 +69,41 @@ func Load() *Config {
 
 		AdminEmail:    getEnv("ADMIN_EMAIL", ""),
 		AdminPassword: getEnv("ADMIN_PASSWORD", ""),
+
+		Agent: AgentConfig{
+			ControlPlaneURL: getEnv("CONTROL_PLANE_URL", "http://localhost:8080"),
+			ID:              getEnv("AGENT_ID", ""),
+			Hostname:        getEnv("AGENT_HOSTNAME", defaultHostname()),
+			AdvertiseAddr:   getEnv("ADVERTISE_ADDR", ""),
+			AdvertiseHost:   getEnv("ADVERTISE_HOST", "127.0.0.1"),
+			Zone:            getEnv("ZONE", ""),
+			Version:         getEnv("AGENT_VERSION", "0.1.0"),
+			CPUsTotal:       getIntEnv("CPUS_TOTAL", 4),
+			MemoryMBTotal:   getIntEnv("MEMORY_MB_TOTAL", 8192),
+		},
 	}
+}
+
+// defaultHostname returns the OS hostname, or "agent" if it cannot be read.
+func defaultHostname() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "agent"
 }
 
 func getEnv(key, fallback string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getIntEnv(key string, fallback int) int {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }

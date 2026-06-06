@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aarani/craftling-go/internal/agent"
 	"github.com/aarani/craftling-go/internal/config"
 	"github.com/aarani/craftling-go/internal/db"
 	"github.com/aarani/craftling-go/internal/handler"
@@ -32,6 +33,8 @@ const (
 	// hostHeartbeatTTL is how long a host may go without heartbeating before it
 	// is marked down.
 	hostHeartbeatTTL = 30 * time.Second
+	// agentCallTimeout bounds each control-plane→agent VM API call.
+	agentCallTimeout = 10 * time.Second
 )
 
 func main() {
@@ -92,9 +95,12 @@ func main() {
 
 	// Continuously reconcile game servers toward their desired state. The
 	// scheduler places unassigned servers onto ready hosts from the same fleet
-	// inventory the agent endpoints and host reaper share.
+	// inventory the agent endpoints and host reaper share; the remote provisioner
+	// then drives the VM by calling the assigned host's agent (the control plane
+	// never touches KVM itself).
 	sched := scheduler.New(hostRepo)
-	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), sched, zlog)
+	prov := provisioner.NewRemote(hostRepo, agent.NewClient(&http.Client{Timeout: agentCallTimeout}))
+	rec := reconciler.New(repository.NewGameServerRepository(pool), prov, sched, zlog)
 	go rec.Run(ctx, reconcileInterval)
 
 	// Start the server in a goroutine so it doesn't block graceful shutdown handling.

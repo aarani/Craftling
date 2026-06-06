@@ -23,6 +23,8 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 
 **P0 done:** goose migrations (`internal/db/migrations`, applied on startup, clean on fresh + pre-existing DBs); `Provisioner` extended with `Start`/`Stop`/`Status` (stopped ≠ destroyed); `Mode` (`server`/`agent`) in `internal/config`.
 
+**P3 done:** control plane ↔ host agent split. `internal/agent` — `Runtime` interface + `FakeRuntime` (in-memory VM lifecycle), an HTTP `Server`/`NewRouter` exposing `POST /vms`, `POST /vms/:id/start|stop`, `DELETE /vms/:id`, `GET /vms/:id`, a `Client` the control plane uses to call an agent, and a `CPClient` the agent uses to register + heartbeat. `provisioner.RemoteProvisioner` implements `Provisioner` by resolving the assigned host's address from the in-memory inventory (`HostResolver`) and calling its agent — the reconciler's call *shape* is unchanged, it just became a network hop, so the control plane never touches KVM. New binary `cmd/agent` (FakeRuntime + register/heartbeat loop with re-register on CP-forgot-me) and `internal/config` `AgentConfig`. The control plane now wires `RemoteProvisioner` instead of `Fake`. Agent state strings mirror `provisioner.State` for 1:1 mapping. Per-VM observed status flows back via `Status` (the seam for P7 drift/health). e2e runs an in-process FakeRuntime agent and drives the full lifecycle across the real HTTP seam (server reaches `running`, the agent reports the VM running tagged with the server id, delete deprovisions it); unit tests cover the runtime, the server↔client round trip, and the RemoteProvisioner (lifecycle, unplaced, start-provisions-fresh).
+
 **P2 done:** `internal/scheduler` — least-loaded placement over the in-memory fleet with **atomic capacity reservation** (`HostRepository.Reserve`/`Release` under the existing lock; `Reserve` is the race-safe commit point, the scheduler picks from a snapshot but only a host that still fits accepts). `game_servers.host_id` (migration `00002`, nullable, **no FK** — referential integrity is the scheduler's job). The reconciler places a `running`-desired, unassigned server before booting its VM; if nothing fits it marks the server `unschedulable` (a new status) and retries next tick; on delete it releases the host capacity. `host_id` persists across stop/start (the VM stays put) and is cleared only on delete. Create-time validation rejects a spec larger than any host's *total* capacity (`Scheduler.CanEverFit`; with no hosts yet it permits creation to wait). Identity reservations are reset to total on a control-plane restart (in-memory fleet) — a known limitation until a durable inventory lands. e2e covers placement (server reaches `running` with a `host_id`, host allocatable reduced) + oversize → `400`; scheduler unit tests cover spread, capacity/memory bounds, down-host exclusion, release, and concurrent reservation atomicity.
 
 **P1 done:** `model.Host` + **in-memory** `HostRepository` (`internal/repository/host.go`, concurrency-safe map — no durable table yet); agent endpoints `POST /api/v1/agent/hosts/register` + `POST /api/v1/agent/hosts/:id/heartbeat` behind a placeholder `middleware.AgentAuth` seam; admin fleet view `GET /api/v1/admin/hosts`; host reaper (`reaper.Hosts`, 30s TTL / 10s sweep) marks stale hosts `down`, heartbeat recovers them to `ready`. **Identity is agent-owned**, not control-plane-assigned: register accepts an optional agent-supplied `id` (authoritative key on upsert), so a host keeps its id across a control-plane restart even though the fleet lives only in memory — this is why no `hosts` table is needed yet. e2e covers register → heartbeat → stale → `down` → recover, plus agent-supplied-id stability.
@@ -65,16 +67,17 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 - **New code:** `internal/scheduler`; `host_id` column (migration `00002`); `HostRepository.Reserve`/`Release`.
 - **Verify:** ✅ scheduler unit tests (spread, capacity/memory bounds, down-host exclusion, release, concurrent reservation) + e2e (placement reaches `running` with `host_id` and reduced host allocatable; oversize → `400`).
 
-## P3 — Agent split (control plane ↔ host agent)
+## P3 — Agent split (control plane ↔ host agent) ✅
 
 - **Goal:** move VM execution off the control-plane process onto the host.
 - **Why:** the control plane must not run KVM; today the reconciler calls `Provisioner` in-process.
 - **Steps:**
-  - New binary `cmd/agent` + `internal/agent` with a `Runtime` interface (ship `FakeRuntime` first) and an agent API (gRPC or REST): provision/start/stop/deprovision/status of local VMs.
-  - `internal/provisioner`: add `RemoteProvisioner` implementing `Provisioner` by calling the assigned host's agent API (address resolved from `hosts` via `host_id`). The reconciler's call *shape* is unchanged — it just becomes a network hop.
-  - Agent registers + heartbeats (P1) and reports per-VM observed status, which reconciles into `game_servers.status`.
-- **New code:** `cmd/agent`, `internal/agent` (`Runtime`, `FakeRuntime`, agent server), `provisioner.RemoteProvisioner`.
-- **Verify:** e2e runs control plane + an in-process `FakeRuntime` agent; full lifecycle across the network seam.
+  - ✅ New binary `cmd/agent` + `internal/agent` with a `Runtime` interface (`FakeRuntime` first) and a REST agent API: provision/start/stop/deprovision/status of local VMs (`agent.Server`/`NewRouter`).
+  - ✅ `internal/provisioner`: `RemoteProvisioner` implements `Provisioner` by calling the assigned host's agent API (address resolved from the in-memory host inventory via `host_id`). The reconciler's call *shape* is unchanged — it just became a network hop.
+  - ✅ Agent registers + heartbeats (P1, via `agent.CPClient`) and reports per-VM observed status through `Status`; the **drift→`game_servers.status`** reconcile loop is intentionally left to P7/P8 (the `Status` seam is in place).
+- **New code:** `cmd/agent`, `internal/agent` (`Runtime`, `FakeRuntime`, `Server`, `Client`, `CPClient`), `provisioner.RemoteProvisioner`, `config.AgentConfig`.
+- **Verify:** ✅ e2e runs the control plane + an in-process `FakeRuntime` agent and exercises the full lifecycle across the real HTTP seam; unit tests cover the runtime, server↔client round trip, and RemoteProvisioner.
+- **Deferred:** agent↔control-plane auth (still the placeholder seam) and the deploy split land in P10; real per-VM status drift reconciliation in P7/P8.
 
 ## P4 — Firecracker runtime
 

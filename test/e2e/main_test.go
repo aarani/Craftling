@@ -14,11 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aarani/craftling-go/internal/agent"
 	"github.com/aarani/craftling-go/internal/config"
 	"github.com/aarani/craftling-go/internal/db"
 	"github.com/aarani/craftling-go/internal/handler"
-	"github.com/aarani/craftling-go/internal/provisioner"
 	"github.com/aarani/craftling-go/internal/model"
+	"github.com/aarani/craftling-go/internal/provisioner"
 	"github.com/aarani/craftling-go/internal/reaper"
 	"github.com/aarani/craftling-go/internal/reconciler"
 	"github.com/aarani/craftling-go/internal/repository"
@@ -52,8 +53,11 @@ const (
 )
 
 // placementHostID is the id of the kept-alive host the reconciler schedules onto
-// in e2e. Set in TestMain.
-var placementHostID string
+// in e2e; agentBaseURL is that host's in-process agent API. Set in TestMain.
+var (
+	placementHostID string
+	agentBaseURL    string
+)
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -99,22 +103,29 @@ func TestMain(m *testing.M) {
 	srv := httptest.NewServer(handler.NewRouter(cfg, zap.NewNop(), pool, hostRepo))
 	baseURL = srv.URL
 
+	// Run an in-process host agent (FakeRuntime) so the control plane drives VMs
+	// across the real network seam (P3): the reconciler's RemoteProvisioner calls
+	// this agent's HTTP API to provision/start/stop/deprovision.
+	agentSrv := httptest.NewServer(agent.NewRouter(agent.NewFakeRuntime("127.0.0.1"), zap.NewNop()))
+	agentBaseURL = agentSrv.URL
+
 	// Run the reconciler with a fast tick so lifecycle tests converge quickly.
 	recCtx, recCancel := context.WithCancel(ctx)
 	sched := scheduler.New(hostRepo)
-	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), sched, zap.NewNop())
+	prov := provisioner.NewRemote(hostRepo, agent.NewClient(nil))
+	rec := reconciler.New(repository.NewGameServerRepository(pool), prov, sched, zap.NewNop())
 	go rec.Run(recCtx, 100*time.Millisecond)
 
 	// Run the host reaper with short timing so the stale->down test converges.
 	go reaper.Hosts(recCtx, zap.NewNop(), hostRepo, hostReapInterval, hostHeartbeatTTL)
 
-	// Register an always-on host so the scheduler has somewhere to place servers,
-	// and keep it alive against the reaper's short TTL. Heartbeating (not
-	// re-registering) preserves its allocatable capacity so reservation
-	// accounting stays observable across the suite.
+	// Register an always-on host whose Address points at the in-process agent, so
+	// the scheduler can place servers and the RemoteProvisioner can reach them.
+	// Keep it alive against the reaper's short TTL by heartbeating (not
+	// re-registering, which would reset its allocatable capacity).
 	placed, err := hostRepo.Register(ctx, &model.Host{
 		Hostname:      "placement-host",
-		Address:       "10.0.0.100:9000",
+		Address:       agentBaseURL,
 		Zone:          "zone-a",
 		CPUsTotal:     placementHostCPUs,
 		MemoryMBTotal: placementHostMemoryMB,
@@ -131,6 +142,7 @@ func TestMain(m *testing.M) {
 
 	recCancel()
 	srv.Close()
+	agentSrv.Close()
 	pool.Close()
 	_ = pg.Terminate(ctx)
 	os.Exit(code)
