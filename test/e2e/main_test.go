@@ -18,9 +18,11 @@ import (
 	"github.com/aarani/craftling-go/internal/db"
 	"github.com/aarani/craftling-go/internal/handler"
 	"github.com/aarani/craftling-go/internal/provisioner"
+	"github.com/aarani/craftling-go/internal/model"
 	"github.com/aarani/craftling-go/internal/reaper"
 	"github.com/aarani/craftling-go/internal/reconciler"
 	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/aarani/craftling-go/internal/scheduler"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -39,6 +41,19 @@ const (
 	hostHeartbeatTTL = 200 * time.Millisecond
 	hostReapInterval = 25 * time.Millisecond
 )
+
+// Capacity of the always-on placement host registered in TestMain. It is sized
+// large in cpu so every test's server can be placed (the scheduler needs a ready
+// host), but its memory total is deliberately below the maximum allowed server
+// spec so a create request can still exceed it and exercise the oversize path.
+const (
+	placementHostCPUs     = 64
+	placementHostMemoryMB = 32768
+)
+
+// placementHostID is the id of the kept-alive host the reconciler schedules onto
+// in e2e. Set in TestMain.
+var placementHostID string
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -86,11 +101,31 @@ func TestMain(m *testing.M) {
 
 	// Run the reconciler with a fast tick so lifecycle tests converge quickly.
 	recCtx, recCancel := context.WithCancel(ctx)
-	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), zap.NewNop())
+	sched := scheduler.New(hostRepo)
+	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), sched, zap.NewNop())
 	go rec.Run(recCtx, 100*time.Millisecond)
 
 	// Run the host reaper with short timing so the stale->down test converges.
 	go reaper.Hosts(recCtx, zap.NewNop(), hostRepo, hostReapInterval, hostHeartbeatTTL)
+
+	// Register an always-on host so the scheduler has somewhere to place servers,
+	// and keep it alive against the reaper's short TTL. Heartbeating (not
+	// re-registering) preserves its allocatable capacity so reservation
+	// accounting stays observable across the suite.
+	placed, err := hostRepo.Register(ctx, &model.Host{
+		Hostname:      "placement-host",
+		Address:       "10.0.0.100:9000",
+		Zone:          "zone-a",
+		CPUsTotal:     placementHostCPUs,
+		MemoryMBTotal: placementHostMemoryMB,
+		AgentVersion:  "test",
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "register placement host: %v\n", err)
+		os.Exit(1)
+	}
+	placementHostID = placed.ID
+	go keepHostAlive(recCtx, hostRepo, placementHostID)
 
 	code := m.Run()
 
@@ -99,4 +134,19 @@ func TestMain(m *testing.M) {
 	pool.Close()
 	_ = pg.Terminate(ctx)
 	os.Exit(code)
+}
+
+// keepHostAlive heartbeats a host well within the reaper TTL so it stays ready
+// for the whole suite, without re-registering (which would reset its capacity).
+func keepHostAlive(ctx context.Context, repo *repository.HostRepository, id string) {
+	ticker := time.NewTicker(hostHeartbeatTTL / 4)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = repo.Heartbeat(ctx, id)
+		}
+	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/aarani/craftling-go/internal/reaper"
 	"github.com/aarani/craftling-go/internal/reconciler"
 	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/aarani/craftling-go/internal/scheduler"
 	"github.com/aarani/craftling-go/internal/seed"
 	"go.uber.org/zap"
 )
@@ -89,8 +90,11 @@ func main() {
 	// Periodically mark hosts down once their heartbeats go stale.
 	go reaper.Hosts(ctx, zlog, hostRepo, hostReapInterval, hostHeartbeatTTL)
 
-	// Continuously reconcile game servers toward their desired state.
-	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), zlog)
+	// Continuously reconcile game servers toward their desired state. The
+	// scheduler places unassigned servers onto ready hosts from the same fleet
+	// inventory the agent endpoints and host reaper share.
+	sched := scheduler.New(hostRepo)
+	rec := reconciler.New(repository.NewGameServerRepository(pool), provisioner.NewFake(), sched, zlog)
 	go rec.Run(ctx, reconcileInterval)
 
 	// Start the server in a goroutine so it doesn't block graceful shutdown handling.

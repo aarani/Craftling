@@ -23,6 +23,8 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 
 **P0 done:** goose migrations (`internal/db/migrations`, applied on startup, clean on fresh + pre-existing DBs); `Provisioner` extended with `Start`/`Stop`/`Status` (stopped ≠ destroyed); `Mode` (`server`/`agent`) in `internal/config`.
 
+**P2 done:** `internal/scheduler` — least-loaded placement over the in-memory fleet with **atomic capacity reservation** (`HostRepository.Reserve`/`Release` under the existing lock; `Reserve` is the race-safe commit point, the scheduler picks from a snapshot but only a host that still fits accepts). `game_servers.host_id` (migration `00002`, nullable, **no FK** — referential integrity is the scheduler's job). The reconciler places a `running`-desired, unassigned server before booting its VM; if nothing fits it marks the server `unschedulable` (a new status) and retries next tick; on delete it releases the host capacity. `host_id` persists across stop/start (the VM stays put) and is cleared only on delete. Create-time validation rejects a spec larger than any host's *total* capacity (`Scheduler.CanEverFit`; with no hosts yet it permits creation to wait). Identity reservations are reset to total on a control-plane restart (in-memory fleet) — a known limitation until a durable inventory lands. e2e covers placement (server reaches `running` with a `host_id`, host allocatable reduced) + oversize → `400`; scheduler unit tests cover spread, capacity/memory bounds, down-host exclusion, release, and concurrent reservation atomicity.
+
 **P1 done:** `model.Host` + **in-memory** `HostRepository` (`internal/repository/host.go`, concurrency-safe map — no durable table yet); agent endpoints `POST /api/v1/agent/hosts/register` + `POST /api/v1/agent/hosts/:id/heartbeat` behind a placeholder `middleware.AgentAuth` seam; admin fleet view `GET /api/v1/admin/hosts`; host reaper (`reaper.Hosts`, 30s TTL / 10s sweep) marks stale hosts `down`, heartbeat recovers them to `ready`. **Identity is agent-owned**, not control-plane-assigned: register accepts an optional agent-supplied `id` (authoritative key on upsert), so a host keeps its id across a control-plane restart even though the fleet lives only in memory — this is why no `hosts` table is needed yet. e2e covers register → heartbeat → stale → `down` → recover, plus agent-supplied-id stability.
 
 ---
@@ -52,16 +54,16 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 - **New code:** `model.Host`, in-memory `HostRepository`, agent host handlers, `middleware.AgentAuth` placeholder, host reaper, admin `GET /api/v1/admin/hosts`.
 - **Verify:** e2e — register host → heartbeat → stale → `down` → recover; agent-supplied-id stability. ✅
 
-## P2 — Scheduler / placement
+## P2 — Scheduler / placement ✅
 
 - **Goal:** assign each unplaced server to a host with capacity.
 - **Steps:**
-  - Add `host_id` to `game_servers` (nullable; a plain id column, **not** a DB FK while the fleet is in-memory — referential integrity is the scheduler's job); add an `unschedulable` signal (status + `status_message`). Relies on P1's agent-owned ids staying stable across restarts.
-  - `internal/scheduler`: pick a `ready` host with enough allocatable cpu/mem (least-loaded/first-fit); **reserve capacity atomically** (transaction).
-  - Reconciler: if a `running`-desired server has no `host_id`, call the scheduler; if nothing fits, mark `unschedulable` and retry next tick.
-  - Create-time validation: reject specs larger than any host can ever fit.
-- **New code:** `internal/scheduler`; `host_id` column; capacity-reservation logic.
-- **Verify:** e2e — create N servers, assert placement spread; oversize request → `unschedulable`/`400`.
+  - ✅ Add `host_id` to `game_servers` (nullable; a plain id column, **not** a DB FK while the fleet is in-memory — referential integrity is the scheduler's job); add an `unschedulable` signal (status + `status_message`). Relies on P1's agent-owned ids staying stable across restarts.
+  - ✅ `internal/scheduler`: pick a `ready` host with enough allocatable cpu/mem (least-loaded/first-fit); **reserve capacity atomically** — the in-memory fleet has no DB transaction, so the reservation commits under `HostRepository`'s lock (`Reserve`), and the scheduler treats a lost race as "try the next candidate".
+  - ✅ Reconciler: if a `running`-desired server has no `host_id`, call the scheduler; if nothing fits, mark `unschedulable` and retry next tick. Capacity is released on delete.
+  - ✅ Create-time validation: reject specs larger than any host can ever fit (`CanEverFit`), allowing creation when the fleet is still empty.
+- **New code:** `internal/scheduler`; `host_id` column (migration `00002`); `HostRepository.Reserve`/`Release`.
+- **Verify:** ✅ scheduler unit tests (spread, capacity/memory bounds, down-host exclusion, release, concurrent reservation) + e2e (placement reaches `running` with `host_id` and reduced host allocatable; oversize → `400`).
 
 ## P3 — Agent split (control plane ↔ host agent)
 

@@ -2,12 +2,21 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/aarani/craftling-go/internal/model"
 	"github.com/google/uuid"
+)
+
+// Capacity-reservation errors returned by Reserve (P2 scheduler).
+var (
+	// ErrHostNotReady means the host exists but is not eligible for placement.
+	ErrHostNotReady = errors.New("host not ready")
+	// ErrInsufficientCapacity means the host lacks free cpu/memory for the spec.
+	ErrInsufficientCapacity = errors.New("insufficient host capacity")
 )
 
 // HostRepository is an in-memory inventory of fleet hosts. P1 keeps the fleet
@@ -126,6 +135,50 @@ func (r *HostRepository) ListReady(_ context.Context) ([]model.Host, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.snapshot(func(h *model.Host) bool { return h.Status == model.HostReady }), nil
+}
+
+// Reserve atomically deducts cpus/memMB from a host's allocatable capacity,
+// committing a scheduler placement. It is the authoritative, race-safe step:
+// the scheduler may pick a host from a stale snapshot, but only the host that
+// still has room under the lock here actually accepts the reservation. Returns
+// ErrNotFound for an unknown id, ErrHostNotReady if the host is not ready, or
+// ErrInsufficientCapacity if it no longer fits.
+func (r *HostRepository) Reserve(_ context.Context, id string, cpus, memMB int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	h, ok := r.hosts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if h.Status != model.HostReady {
+		return ErrHostNotReady
+	}
+	if h.CPUsAllocatable < cpus || h.MemoryMBAllocatable < memMB {
+		return ErrInsufficientCapacity
+	}
+	h.CPUsAllocatable -= cpus
+	h.MemoryMBAllocatable -= memMB
+	h.UpdatedAt = now()
+	return nil
+}
+
+// Release returns cpus/memMB to a host's allocatable capacity, clamped to its
+// total so repeated or stale releases cannot inflate it past physical capacity.
+// An unknown host is a no-op: the fleet lives in memory, so a control-plane
+// restart can legitimately forget a host that still has servers assigned.
+func (r *HostRepository) Release(_ context.Context, id string, cpus, memMB int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	h, ok := r.hosts[id]
+	if !ok {
+		return nil
+	}
+	h.CPUsAllocatable = min(h.CPUsAllocatable+cpus, h.CPUsTotal)
+	h.MemoryMBAllocatable = min(h.MemoryMBAllocatable+memMB, h.MemoryMBTotal)
+	h.UpdatedAt = now()
+	return nil
 }
 
 // MarkStale marks every host whose last heartbeat predates cutoff as down, and

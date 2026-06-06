@@ -4,11 +4,13 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/aarani/craftling-go/internal/model"
 	"github.com/aarani/craftling-go/internal/provisioner"
 	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/aarani/craftling-go/internal/scheduler"
 	"go.uber.org/zap"
 )
 
@@ -16,12 +18,13 @@ import (
 type Reconciler struct {
 	servers *repository.GameServerRepository
 	prov    provisioner.Provisioner
+	sched   *scheduler.Scheduler
 	log     *zap.Logger
 }
 
 // New constructs a Reconciler.
-func New(servers *repository.GameServerRepository, prov provisioner.Provisioner, log *zap.Logger) *Reconciler {
-	return &Reconciler{servers: servers, prov: prov, log: log}
+func New(servers *repository.GameServerRepository, prov provisioner.Provisioner, sched *scheduler.Scheduler, log *zap.Logger) *Reconciler {
+	return &Reconciler{servers: servers, prov: prov, sched: sched, log: log}
 }
 
 // Run reconciles on each tick until ctx is cancelled.
@@ -77,19 +80,55 @@ func (r *Reconciler) start(ctx context.Context, s *model.GameServer) error {
 	if s.Status == model.StatusRunning {
 		return nil
 	}
-	if err := r.servers.MarkStatus(ctx, s.ID, model.StatusProvisioning, ""); err != nil {
-		return err
-	}
 	// A server that already has a VM was provisioned before and merely stopped;
 	// resume it rather than creating a fresh one.
 	provisioned := s.VMID != nil && *s.VMID != ""
+	// Place a not-yet-provisioned, unassigned server on a host before booting a
+	// new VM. A resumed VM already lives on its host; an already-assigned server
+	// keeps its reservation across a failed attempt, so neither re-schedules.
+	if !provisioned && s.HostID == nil {
+		if err := r.place(ctx, s); err != nil {
+			return err
+		}
+		if s.HostID == nil {
+			return nil // unschedulable; retried next tick
+		}
+	}
+	if err := r.servers.MarkStatus(ctx, s.ID, model.StatusProvisioning, ""); err != nil {
+		return err
+	}
 	inst, err := r.provisionOrStart(ctx, s, provisioned)
 	if err != nil {
 		return err
 	}
 	r.log.Info("server running",
-		zap.String("id", s.ID), zap.String("vm_id", inst.VMID), zap.Bool("resumed", provisioned))
+		zap.String("id", s.ID), zap.String("vm_id", inst.VMID),
+		zap.Stringp("host_id", s.HostID), zap.Bool("resumed", provisioned))
 	return r.servers.MarkRunning(ctx, s.ID, inst.VMID, inst.Host, inst.Port)
+}
+
+// place asks the scheduler for a host, reserves its capacity, and persists the
+// assignment onto s (both in the DB and the in-memory struct). When nothing
+// fits it marks the server unschedulable and leaves s.HostID nil; the caller
+// detects that and yields until the next tick. A reservation that cannot be
+// persisted is released so capacity is not leaked.
+func (r *Reconciler) place(ctx context.Context, s *model.GameServer) error {
+	hostID, err := r.sched.Schedule(ctx, s)
+	if errors.Is(err, scheduler.ErrNoCapacity) {
+		r.log.Warn("no capacity to place server", zap.String("id", s.ID),
+			zap.Int("cpus", s.CPUs), zap.Int("memory_mb", s.MemoryMB))
+		return r.servers.MarkStatus(ctx, s.ID, model.StatusUnschedulable,
+			"no host with sufficient capacity")
+	}
+	if err != nil {
+		return err
+	}
+	if err := r.servers.AssignHost(ctx, s.ID, hostID); err != nil {
+		_ = r.sched.Release(ctx, hostID, s.CPUs, s.MemoryMB)
+		return err
+	}
+	s.HostID = &hostID
+	return nil
 }
 
 // provisionOrStart resumes an existing VM or provisions a new one.
@@ -124,6 +163,10 @@ func (r *Reconciler) delete(ctx context.Context, s *model.GameServer) error {
 	}
 	if err := r.prov.Deprovision(ctx, s); err != nil {
 		return err
+	}
+	// The VM is gone, so return its reserved capacity to the host.
+	if s.HostID != nil {
+		_ = r.sched.Release(ctx, *s.HostID, s.CPUs, s.MemoryMB)
 	}
 	r.log.Info("server deleted", zap.String("id", s.ID))
 	return r.servers.SoftDelete(ctx, s.ID)

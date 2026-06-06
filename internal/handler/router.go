@@ -6,6 +6,7 @@ import (
 	"github.com/aarani/craftling-go/internal/middleware"
 	"github.com/aarani/craftling-go/internal/model"
 	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/aarani/craftling-go/internal/scheduler"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -25,7 +26,9 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool, hostRepo
 	gameServerRepo := repository.NewGameServerRepository(pool)
 	authHandler := NewAuthHandler(userRepo, refreshRepo, jwtManager, cfg.RefreshTTL)
 	adminHandler := NewAdminHandler(userRepo, gameServerRepo, hostRepo)
-	serverHandler := NewServerHandler(gameServerRepo)
+	// The scheduler is stateless over the shared in-memory host inventory, so the
+	// handler builds its own; the reconciler builds another over the same store.
+	serverHandler := NewServerHandler(gameServerRepo, scheduler.New(hostRepo))
 	agentHandler := NewAgentHandler(hostRepo)
 
 	r := gin.New()

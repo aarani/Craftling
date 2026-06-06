@@ -8,6 +8,7 @@ import (
 	"github.com/aarani/craftling-go/internal/middleware"
 	"github.com/aarani/craftling-go/internal/model"
 	"github.com/aarani/craftling-go/internal/repository"
+	"github.com/aarani/craftling-go/internal/scheduler"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -21,11 +22,12 @@ const (
 // ServerHandler serves the game-server CRUD endpoints.
 type ServerHandler struct {
 	servers *repository.GameServerRepository
+	sched   *scheduler.Scheduler
 }
 
 // NewServerHandler constructs a ServerHandler.
-func NewServerHandler(servers *repository.GameServerRepository) *ServerHandler {
-	return &ServerHandler{servers: servers}
+func NewServerHandler(servers *repository.GameServerRepository, sched *scheduler.Scheduler) *ServerHandler {
+	return &ServerHandler{servers: servers, sched: sched}
 }
 
 type createServerRequest struct {
@@ -49,13 +51,28 @@ func (h *ServerHandler) Create(c *gin.Context) {
 		return
 	}
 
+	cpus := orDefault(req.CPUs, defaultCPUs)
+	memoryMB := orDefault(req.MemoryMB, defaultMemoryMB)
+
+	// Reject a spec no host could ever run, rather than admitting a server that
+	// would sit unschedulable forever. With no hosts yet, creation is allowed —
+	// the server waits for a host to join.
+	if ok, err := h.sched.CanEverFit(c.Request.Context(), cpus, memoryMB); err != nil {
+		logger.FromContext(c).Error("capacity check", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	} else if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "requested resources exceed the capacity of any host in the fleet"})
+		return
+	}
+
 	s := &model.GameServer{
 		OwnerID:      middleware.UserIDFromContext(c),
 		Name:         req.Name,
 		Game:         model.GameMinecraft,
 		Version:      req.Version,
-		CPUs:         orDefault(req.CPUs, defaultCPUs),
-		MemoryMB:     orDefault(req.MemoryMB, defaultMemoryMB),
+		CPUs:         cpus,
+		MemoryMB:     memoryMB,
 		DesiredState: model.DesiredRunning,
 		Status:       model.StatusPending,
 	}

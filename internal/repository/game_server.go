@@ -21,7 +21,7 @@ func NewGameServerRepository(pool *pgxpool.Pool) *GameServerRepository {
 }
 
 const gameServerColumns = `id, owner_id, name, game, version, cpus, memory_mb,
-	desired_state, status, vm_id, host, port, status_message, created_at, updated_at`
+	desired_state, status, host_id, vm_id, host, port, status_message, created_at, updated_at`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface {
@@ -32,7 +32,7 @@ func scanGameServer(row scannable) (*model.GameServer, error) {
 	var s model.GameServer
 	err := row.Scan(
 		&s.ID, &s.OwnerID, &s.Name, &s.Game, &s.Version, &s.CPUs, &s.MemoryMB,
-		&s.DesiredState, &s.Status, &s.VMID, &s.Host, &s.Port, &s.StatusMessage,
+		&s.DesiredState, &s.Status, &s.HostID, &s.VMID, &s.Host, &s.Port, &s.StatusMessage,
 		&s.CreatedAt, &s.UpdatedAt,
 	)
 	if err != nil {
@@ -128,6 +128,16 @@ func (r *GameServerRepository) SetDesiredState(ctx context.Context, id, desired 
 	return err
 }
 
+// AssignHost records the fleet host the scheduler placed a server on (P2). The
+// capacity reservation itself lives in the host inventory; this persists the
+// assignment so it survives a reconciler restart and is visible in the API.
+func (r *GameServerRepository) AssignHost(ctx context.Context, id, hostID string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE game_servers SET host_id = $2, updated_at = now() WHERE id = $1`,
+		id, hostID)
+	return err
+}
+
 // MarkStatus sets the observed status and an optional message (empty -> NULL).
 func (r *GameServerRepository) MarkStatus(ctx context.Context, id, status, message string) error {
 	_, err := r.pool.Exec(ctx,
@@ -163,7 +173,7 @@ func (r *GameServerRepository) MarkStopped(ctx context.Context, id string) error
 func (r *GameServerRepository) SoftDelete(ctx context.Context, id string) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE game_servers
-		SET status = 'deleted', vm_id = NULL, host = NULL, port = NULL,
+		SET status = 'deleted', host_id = NULL, vm_id = NULL, host = NULL, port = NULL,
 		    status_message = NULL, deleted_at = now(), updated_at = now()
 		WHERE id = $1`,
 		id)
