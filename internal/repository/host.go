@@ -48,7 +48,20 @@ var now = time.Now
 //
 // A registered or recovering host is marked ready and its heartbeat stamped now.
 // Allocatable capacity is initialised to total when the record is first created.
-func (r *HostRepository) Register(_ context.Context, h *model.Host) (*model.Host, error) {
+func (r *HostRepository) Register(ctx context.Context, h *model.Host) (*model.Host, error) {
+	return r.RegisterReserved(ctx, h, 0, 0)
+}
+
+// RegisterReserved is Register with a known amount of already-committed capacity.
+// When the host is *new* to this process — the case after a control-plane
+// restart, where the in-memory fleet was lost but the agent re-registers with
+// its stable id — allocatable is initialised to total minus the reserved cpu/mem
+// the caller reconstructed from the durable record, rather than to total. This
+// keeps existing placements (including ones whose VM never booted) accounted for
+// across a restart. For a host already known to this process the reserved
+// arguments are ignored: its in-memory allocatable already reflects live
+// reservations and is authoritative.
+func (r *HostRepository) RegisterReserved(_ context.Context, h *model.Host, reservedCPUs, reservedMemMB int) (*model.Host, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -71,13 +84,22 @@ func (r *HostRepository) Register(_ context.Context, h *model.Host) (*model.Host
 		stored.ID = uuid.NewString()
 	}
 	stored.Status = model.HostReady
-	stored.CPUsAllocatable = h.CPUsTotal
-	stored.MemoryMBAllocatable = h.MemoryMBTotal
+	stored.CPUsAllocatable = clampNonNeg(h.CPUsTotal - reservedCPUs)
+	stored.MemoryMBAllocatable = clampNonNeg(h.MemoryMBTotal - reservedMemMB)
 	stored.LastHeartbeatAt = t
 	stored.CreatedAt = t
 	stored.UpdatedAt = t
 	r.hosts[stored.ID] = &stored
 	return clone(&stored), nil
+}
+
+// clampNonNeg floors a value at zero, guarding against reconstructed reservations
+// that somehow exceed a host's reported total.
+func clampNonNeg(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // matchExisting finds the record a registration refers to: by agent-supplied id

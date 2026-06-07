@@ -128,6 +128,24 @@ func (r *GameServerRepository) SetDesiredState(ctx context.Context, id, desired 
 	return err
 }
 
+// UsedCapacity returns the total cpu and memory currently committed to a host:
+// the sum over every live (non-deleted) server assigned to it. A server keeps
+// its reservation while stopped (the VM stays put), so this counts all assigned
+// servers regardless of status. It lets the control plane rebuild a host's
+// allocatable capacity from the durable record after a restart, instead of
+// resetting it to total and forgetting in-flight placements.
+func (r *GameServerRepository) UsedCapacity(ctx context.Context, hostID string) (cpus, memoryMB int, err error) {
+	if hostID == "" {
+		return 0, 0, nil
+	}
+	err = r.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(cpus), 0), COALESCE(SUM(memory_mb), 0)
+		FROM game_servers
+		WHERE host_id = $1 AND deleted_at IS NULL`,
+		hostID).Scan(&cpus, &memoryMB)
+	return cpus, memoryMB, err
+}
+
 // AssignHost records the fleet host the scheduler placed a server on (P2). The
 // capacity reservation itself lives in the host inventory; this persists the
 // assignment so it survives a reconciler restart and is visible in the API.

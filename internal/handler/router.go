@@ -29,7 +29,7 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool, hostRepo
 	// The scheduler is stateless over the shared in-memory host inventory, so the
 	// handler builds its own; the reconciler builds another over the same store.
 	serverHandler := NewServerHandler(gameServerRepo, scheduler.New(hostRepo))
-	agentHandler := NewAgentHandler(hostRepo)
+	agentHandler := NewAgentHandler(hostRepo, gameServerRepo)
 
 	r := gin.New()
 	r.Use(gin.Recovery())

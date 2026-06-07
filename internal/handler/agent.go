@@ -14,12 +14,13 @@ import (
 // AgentHandler serves the agent-facing host endpoints: a host agent registers
 // itself and then heartbeats to prove liveness.
 type AgentHandler struct {
-	hosts *repository.HostRepository
+	hosts   *repository.HostRepository
+	servers *repository.GameServerRepository
 }
 
 // NewAgentHandler constructs an AgentHandler.
-func NewAgentHandler(hosts *repository.HostRepository) *AgentHandler {
-	return &AgentHandler{hosts: hosts}
+func NewAgentHandler(hosts *repository.HostRepository, servers *repository.GameServerRepository) *AgentHandler {
+	return &AgentHandler{hosts: hosts, servers: servers}
 }
 
 type registerHostRequest struct {
@@ -43,7 +44,20 @@ func (h *AgentHandler) Register(c *gin.Context) {
 		return
 	}
 
-	host, err := h.hosts.Register(c.Request.Context(), &model.Host{
+	ctx := c.Request.Context()
+
+	// Reconstruct any capacity already committed to this host from the durable
+	// record, so a host re-registering after a control-plane restart comes back
+	// with its real allocatable rather than a clean slate. Only meaningful when
+	// the agent supplies its stable id (otherwise there is nothing to match).
+	usedCPUs, usedMemMB, err := h.servers.UsedCapacity(ctx, req.ID)
+	if err != nil {
+		logger.FromContext(c).Error("reconstruct host capacity", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	host, err := h.hosts.RegisterReserved(ctx, &model.Host{
 		ID:            req.ID,
 		Hostname:      req.Hostname,
 		Address:       req.Address,
@@ -51,7 +65,7 @@ func (h *AgentHandler) Register(c *gin.Context) {
 		CPUsTotal:     req.CPUsTotal,
 		MemoryMBTotal: req.MemoryMBTotal,
 		AgentVersion:  req.AgentVersion,
-	})
+	}, usedCPUs, usedMemMB)
 	if err != nil {
 		logger.FromContext(c).Error("register host", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
