@@ -82,6 +82,28 @@ char __license[] SEC("license") = "GPL";
 #define EV_INBOUND_REPLY 3 // VM -> internet (reply to inbound, un-DNAT)
 #define EV_DENY 4          // dropped by policy / parse
 
+// vmlinux.h only forward-declares enum nf_nat_manip_type (no enumerators) and
+// omits struct bpf_ct_opts entirely — BTF dedup drops both because nothing in
+// the kernel's tracked types fully references them — so define them here.
+// Completing the forward-declared enum is legal C. The bpf_ct_opts layout MUST
+// match the running kernel's (the kfuncs reject a mismatched opts__sz): this is
+// the >= 6.5 form with the ct_zone fields, NF_BPF_CT_OPTS_SZ == 16. Matches the
+// kernel >= 6.6 requirement documented above.
+enum nf_nat_manip_type {
+	NF_NAT_MANIP_SRC,
+	NF_NAT_MANIP_DST,
+};
+
+struct bpf_ct_opts {
+	s32 netns_id;
+	s32 error;
+	u8 l4proto;
+	u8 dir;
+	u16 ct_zone_id;
+	u8 ct_zone_dir;
+	u8 reserved[3];
+};
+
 // ---- conntrack kfuncs ------------------------------------------------------
 // Declared as kernel symbols; the verifier resolves them against BTF at load.
 
