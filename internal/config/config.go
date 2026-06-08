@@ -34,10 +34,21 @@ type Config struct {
 	Agent AgentConfig
 }
 
+// Agent runtime kinds: "fake" simulates VMs in memory (default, no KVM needed);
+// "firecracker" boots real microVMs and requires /dev/kvm.
+const (
+	RuntimeFake        = "fake"
+	RuntimeFirecracker = "firecracker"
+)
+
 // AgentConfig holds the host-worker settings used when Mode == ModeAgent.
 type AgentConfig struct {
 	// ControlPlaneURL is where the agent registers and heartbeats.
 	ControlPlaneURL string
+	// Runtime selects the VM backend: "fake" (default) or "firecracker".
+	Runtime string
+	// Firecracker holds the real-microVM driver settings (Runtime == "firecracker").
+	Firecracker FirecrackerConfig
 	// ID is this agent's stable, self-owned host id (kept across CP restarts).
 	ID string
 	// Hostname identifies the host in the fleet view.
@@ -56,6 +67,21 @@ type AgentConfig struct {
 	MemoryMBTotal int
 }
 
+// FirecrackerConfig holds the paths the Firecracker driver needs (P4). It mirrors
+// firecracker.Config; cmd/agent maps it across to avoid a config→driver import.
+type FirecrackerConfig struct {
+	// BinaryPath is the firecracker executable (empty: look up on PATH).
+	BinaryPath string
+	// KernelPath is the uncompressed kernel (vmlinux) all VMs boot.
+	KernelPath string
+	// ImageDir holds per-version base rootfs images (minecraft-<version>.ext4).
+	ImageDir string
+	// DefaultImage is the rootfs filename used when a version has no image.
+	DefaultImage string
+	// WorkDir is where per-VM working dirs live (empty: OS temp dir).
+	WorkDir string
+}
+
 // Load reads configuration from the environment, applying sensible defaults.
 func Load() *Config {
 	return &Config{
@@ -72,14 +98,22 @@ func Load() *Config {
 
 		Agent: AgentConfig{
 			ControlPlaneURL: getEnv("CONTROL_PLANE_URL", "http://localhost:8080"),
-			ID:              getEnv("AGENT_ID", ""),
-			Hostname:        getEnv("AGENT_HOSTNAME", defaultHostname()),
-			AdvertiseAddr:   getEnv("ADVERTISE_ADDR", ""),
-			AdvertiseHost:   getEnv("ADVERTISE_HOST", "127.0.0.1"),
-			Zone:            getEnv("ZONE", ""),
-			Version:         getEnv("AGENT_VERSION", "0.1.0"),
-			CPUsTotal:       getIntEnv("CPUS_TOTAL", 4),
-			MemoryMBTotal:   getIntEnv("MEMORY_MB_TOTAL", 8192),
+			Runtime:         getEnv("AGENT_RUNTIME", RuntimeFake),
+			Firecracker: FirecrackerConfig{
+				BinaryPath:   getEnv("FC_BINARY", ""),
+				KernelPath:   getEnv("FC_KERNEL", ""),
+				ImageDir:     getEnv("FC_IMAGE_DIR", ""),
+				DefaultImage: getEnv("FC_DEFAULT_IMAGE", ""),
+				WorkDir:      getEnv("FC_WORK_DIR", ""),
+			},
+			ID:            getEnv("AGENT_ID", ""),
+			Hostname:      getEnv("AGENT_HOSTNAME", defaultHostname()),
+			AdvertiseAddr: getEnv("ADVERTISE_ADDR", ""),
+			AdvertiseHost: getEnv("ADVERTISE_HOST", "127.0.0.1"),
+			Zone:          getEnv("ZONE", ""),
+			Version:       getEnv("AGENT_VERSION", "0.1.0"),
+			CPUsTotal:     getIntEnv("CPUS_TOTAL", 4),
+			MemoryMBTotal: getIntEnv("MEMORY_MB_TOTAL", 8192),
 		},
 	}
 }

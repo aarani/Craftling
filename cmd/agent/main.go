@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aarani/craftling-go/internal/agent"
+	"github.com/aarani/craftling-go/internal/agent/firecracker"
 	"github.com/aarani/craftling-go/internal/config"
 	applogger "github.com/aarani/craftling-go/internal/logger"
 	"go.uber.org/zap"
@@ -46,7 +48,10 @@ func main() {
 	}
 
 	// The runtime that actually runs VMs, fronted by the agent HTTP API.
-	rt := agent.NewFakeRuntime(cfg.Agent.AdvertiseHost)
+	rt, err := newRuntime(cfg, zlog)
+	if err != nil {
+		zlog.Fatal("init runtime", zap.Error(err))
+	}
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      agent.NewRouter(rt, zlog),
@@ -88,6 +93,30 @@ func main() {
 		zlog.Fatal("forced shutdown", zap.Error(err))
 	}
 	zlog.Info("agent exited")
+}
+
+// newRuntime selects the VM backend by config: the in-memory FakeRuntime for
+// local/dev runs, or the real Firecracker driver (P4) on KVM hosts.
+func newRuntime(cfg *config.Config, log *zap.Logger) (agent.Runtime, error) {
+	switch cfg.Agent.Runtime {
+	case config.RuntimeFirecracker:
+		log.Info("using firecracker runtime",
+			zap.String("kernel", cfg.Agent.Firecracker.KernelPath),
+			zap.String("image_dir", cfg.Agent.Firecracker.ImageDir))
+		return firecracker.New(firecracker.Config{
+			BinaryPath:    cfg.Agent.Firecracker.BinaryPath,
+			KernelPath:    cfg.Agent.Firecracker.KernelPath,
+			ImageDir:      cfg.Agent.Firecracker.ImageDir,
+			DefaultImage:  cfg.Agent.Firecracker.DefaultImage,
+			WorkDir:       cfg.Agent.Firecracker.WorkDir,
+			AdvertiseHost: cfg.Agent.AdvertiseHost,
+		})
+	case config.RuntimeFake, "":
+		log.Info("using fake runtime")
+		return agent.NewFakeRuntime(cfg.Agent.AdvertiseHost), nil
+	default:
+		return nil, fmt.Errorf("unknown agent runtime %q", cfg.Agent.Runtime)
+	}
 }
 
 // runRegistration registers the host then heartbeats on an interval until ctx is
