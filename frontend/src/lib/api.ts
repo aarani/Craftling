@@ -71,6 +71,35 @@ export interface UpdateServerInput {
   desired_state?: "running" | "stopped"
 }
 
+// ── Template registry (marketplace) ─────────────────────────────────────────-
+
+/** One entry in the registry index. */
+export interface TemplateSummary {
+  template_id: string
+  template_name: string
+  thumbnail_url: string
+  template_url: string
+}
+
+/** A single question the template asks the operator before launch. */
+export interface TemplateVariable {
+  name: string
+  description: string
+  acceptable_answers: string[]
+}
+
+/** The full manifest for one template, fetched on selection. */
+export interface TemplateManifest {
+  image_name: string
+  image_tag: string
+  template_name: string
+  thumbnail_url: string
+  eula_needed: boolean
+  guest_volumes: string[]
+  variables: TemplateVariable[]
+  env: Record<string, string>
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
@@ -228,6 +257,18 @@ export const api = {
     return request<{ users: ApiUser[] | null }>("/admin/users").then((r) => r.users ?? [])
   },
 
+  // Registry index: the templates available to launch.
+  listTemplates(): Promise<TemplateSummary[]> {
+    return request<{ templates: TemplateSummary[] | null }>("/templates").then(
+      (r) => r.templates ?? []
+    )
+  },
+
+  // Full manifest for a single template.
+  getTemplate(id: string): Promise<TemplateManifest> {
+    return request<TemplateManifest>(`/templates/${id}`)
+  },
+
   createServer(input: CreateServerInput): Promise<ApiServer> {
     return request<ApiServer>("/servers", { method: "POST", body: JSON.stringify(input) })
   },
@@ -256,6 +297,24 @@ export const api = {
     }
     await this.updateServer(id, { desired_state: "running" })
   },
+}
+
+// ── Template env resolution ──────────────────────────────────────────────────
+
+/** Substitute `$VarName$` placeholders in a template's env with the operator's
+ *  answers. Tokens whose variable has no answer are left untouched, so partially
+ *  filled forms still render a meaningful preview. */
+export function resolveEnv(
+  env: Record<string, string>,
+  answers: Record<string, string>
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, val] of Object.entries(env)) {
+    out[key] = val.replace(/\$([A-Za-z0-9_]+)\$/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(answers, name) ? answers[name] : whole
+    )
+  }
+  return out
 }
 
 // ── Adapter: ApiServer → UI Server ──────────────────────────────────────────

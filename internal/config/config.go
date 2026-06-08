@@ -25,6 +25,10 @@ type Config struct {
 	AccessTTL   time.Duration
 	RefreshTTL  time.Duration
 
+	// TemplateIndexURL is the registry/marketplace index the control plane fetches
+	// the list of game-server templates from.
+	TemplateIndexURL string
+
 	// Optional admin bootstrap; when both are set, the admin is seeded on startup.
 	AdminEmail    string
 	AdminPassword string
@@ -92,6 +96,8 @@ func Load() *Config {
 		JWTSecret:   getEnv("JWT_SECRET", "dev-secret-change-me"),
 		AccessTTL:   getDurationEnv("ACCESS_TTL", 15*time.Minute),
 		RefreshTTL:  getDurationEnv("REFRESH_TTL", 30*24*time.Hour),
+
+		TemplateIndexURL: getEnv("TEMPLATE_INDEX_URL", "https://registry.craftling.io/manifest.json"),
 
 		AdminEmail:    getEnv("ADMIN_EMAIL", ""),
 		AdminPassword: getEnv("ADMIN_PASSWORD", ""),

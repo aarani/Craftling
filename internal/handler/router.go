@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"net/http"
+	"time"
+
 	"github.com/aarani/craftling-go/internal/auth"
 	"github.com/aarani/craftling-go/internal/config"
 	"github.com/aarani/craftling-go/internal/middleware"
 	"github.com/aarani/craftling-go/internal/model"
+	"github.com/aarani/craftling-go/internal/registry"
 	"github.com/aarani/craftling-go/internal/repository"
 	"github.com/aarani/craftling-go/internal/scheduler"
 	"github.com/gin-gonic/gin"
@@ -30,6 +34,7 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool, hostRepo
 	// handler builds its own; the reconciler builds another over the same store.
 	serverHandler := NewServerHandler(gameServerRepo, scheduler.New(hostRepo))
 	agentHandler := NewAgentHandler(hostRepo, gameServerRepo)
+	templateHandler := NewTemplateHandler(registry.New(cfg.TemplateIndexURL, &http.Client{Timeout: 10 * time.Second}))
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -62,6 +67,14 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool, hostRepo
 			servers.GET("/:id", serverHandler.Get)
 			servers.PATCH("/:id", serverHandler.Update)
 			servers.DELETE("/:id", serverHandler.Delete)
+		}
+
+		// Template registry / marketplace (owner- and operator-accessible).
+		templates := api.Group("/templates")
+		templates.Use(middleware.Auth(jwtManager))
+		{
+			templates.GET("", templateHandler.List)
+			templates.GET("/:id", templateHandler.Get)
 		}
 
 		// Admin-only routes.

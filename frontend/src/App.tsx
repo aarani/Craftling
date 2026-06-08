@@ -3,6 +3,7 @@ import { useEffect, useState } from "react"
 import { AppShell, type Route } from "@/components/app-shell"
 import { AuthScreen } from "@/components/auth-screen"
 import { ServersView } from "@/components/servers-view"
+import { MarketplaceView } from "@/components/marketplace-view"
 import { StubView } from "@/components/stub-view"
 import { Icon } from "@/components/icon"
 import { usePersist } from "@/lib/use-persist"
@@ -49,6 +50,8 @@ export function App() {
     >
       {route === "servers" ? (
         <ServersView role={role} onCountChange={setServerCount} />
+      ) : route === "marketplace" ? (
+        <MarketplaceView />
       ) : (
         <StubView route={route} />
       )}

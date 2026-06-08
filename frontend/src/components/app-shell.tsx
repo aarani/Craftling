@@ -8,6 +8,7 @@ import type { Role } from "@/lib/data"
 
 export type Route =
   | "servers"
+  | "marketplace"
   | "hosts"
   | "scheduler"
   | "observability"
@@ -26,6 +27,7 @@ export const NAV: { group: string; items: NavItem[] }[] = [
     group: "Operate",
     items: [
       { id: "servers", label: "Game Servers", icon: "cube", roles: ["operator", "owner"] },
+      { id: "marketplace", label: "Marketplace", icon: "globe", roles: ["operator", "owner"] },
       { id: "hosts", label: "Host Fleet", icon: "hosts", roles: ["operator"] },
       { id: "scheduler", label: "Scheduler", icon: "schedule", roles: ["operator"] },
     ],
@@ -133,6 +135,7 @@ function Topbar({
   const { user, logout } = useAuth()
   const titles: Record<Route, string> = {
     servers: role === "owner" ? "My Servers" : "Game Servers",
+    marketplace: "Marketplace",
     hosts: "Host Fleet",
     scheduler: "Scheduler",
     observability: "Observability",
