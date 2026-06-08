@@ -2,11 +2,14 @@
 
 > **Status:** design / not yet built. This is the spec to review before code lands.
 >
-> **Goal:** give each Firecracker microVM real connectivity using a pure-eBPF
-> datapath — no Linux bridge, no `nftables`/`iptables`, no kernel conntrack. We
-> own connection tracking, SNAT (masquerade), and DNAT (port-forward) in eBPF,
-> attached via TCX (kernel ≥ 6.6). Filtering and observability are part of the
-> same programs.
+> **Goal:** give each Firecracker microVM real connectivity using an eBPF
+> datapath — no Linux bridge, and **no `iptables`/`nftables` rules** (the actual
+> constraint: we refuse to manage userspace netfilter rule chains). We do the
+> packet parse, rewrite, redirect, filtering, and observability in eBPF programs
+> attached via TCX (kernel ≥ 6.6), and we **reuse the kernel's `nf_conntrack`
+> table — driven directly from eBPF via the `bpf_ct_*` kfuncs** — for connection
+> tracking, TCP state, and NAT source-port allocation. `nf_conntrack` is a kernel
+> module, not a ruleset: it just needs to be loaded; we install zero rules.
 >
 > **Two flows in scope:**
 > 1. **Egress** — VM → internet (Minecraft auth, mod downloads, etc.), with
@@ -15,14 +18,25 @@
 >    "random host port") DNAT'd to the in-VM service port (25565), with
 >    source filtering and observability.
 
-## 1. Why full-eBPF here (and what it costs)
+## 1. What we own vs. what we reuse
 
-The hybrid alternative (eBPF filter + `nftables` NAT) is less code, but we chose
-to own the dataplane. The cost is real and concentrated in **connection
-tracking**: source-port allocation, forward/reverse 5-tuple rewrite, entry
-expiry + port reclamation, and a TCP state subset. The rest (parse, checksum
-fixups, redirect) is mechanical. The sections below treat conntrack as the spine
-everything else hangs off.
+The constraint is "no iptables/nftables rules," not "no kernel code." So we split
+the work where it's cheapest:
+
+- **Reused (kernel `nf_conntrack` via `bpf_ct_*` kfuncs):** connection tracking,
+  the full TCP state machine + timeouts, garbage collection of dead flows, and
+  **NAT source-port allocation** (`bpf_ct_set_nat_info` reserves a unique manip
+  tuple). These were the two hardest, most correctness-sensitive subsystems in
+  the earlier "own everything" sketch — and they vanish. Cost: depend on the
+  `nf_conntrack` module being loaded (no rules), kfuncs are ≥6.1 (we target ≥6.6).
+- **Owned (eBPF):** packet parse, the actual header **rewrite** (we bypass the
+  netfilter NAT hooks via `tc` redirect, so the kernel won't mangle for us — we
+  read the allocated tuple off the `nf_conn` and rewrite the packet ourselves),
+  `bpf_redirect`/`bpf_redirect_neigh` steering, egress/ingress filtering, and
+  observability.
+
+The sections below describe the owned datapath; conntrack appears as kfunc calls,
+not as a hand-built map.
 
 ## 2. Topology & addressing
 
@@ -36,8 +50,8 @@ or forward these packets and `ip_forward` is **not** required.
                     │     │  ▲                                                     │
                     │  [tc ingress: nat_uplink]   (bpf_redirect_neigh out uplink)  │
                     │     ▼  │                                                     │
-                    │   conntrack / SNAT / DNAT maps (shared, pinned)              │
-                    │     ▲  │                                                     │
+                    │   kernel nf_conntrack (via bpf_ct_* kfuncs) + DNAT/policy    │
+                    │     ▲  │   maps (shared, pinned)                             │
                     │  [tc ingress: nat_tap]  ──── bpf_redirect(tapN, 0) ────┐     │
                     │     │                                                  ▼     │
                     │   tap0 (fc…)   tap1 (fc…)   …   tapN ───────────▶  Firecracker│
@@ -62,8 +76,9 @@ or forward these packets and `ip_forward` is **not** required.
 
 A **single shared eBPF collection**, loaded once at agent start. This is a
 structural change from the current per-TAP `tapfilter` (which loads one objects
-set per TAP): conntrack/port/policy state must be shared across **all** TAPs and
-the uplink, so we load once and attach the same programs to many ifindices.
+set per TAP): the DNAT/policy maps must be shared across **all** TAPs and the
+uplink, so we load once and attach the same programs to many ifindices. (The
+conntrack table is the kernel's, shared by nature.)
 
 | Program (`SEC`) | Attach point | Handles |
 |---|---|---|
@@ -84,102 +99,88 @@ Programs may exceed the verifier's complexity budget as a monolith — split int
 |---|---|---|---|
 | `vm_config` | HASH | `tap_ifindex` / `vm_ip` → `{vm_ip, vm_mac, tap_ifindex}` | VM identity + where to redirect inbound |
 | `dnat_rules` | HASH | `{proto, host_ip, host_port}` → `{vm_ip, vm_port, tap_ifindex, vm_mac}` | Published-port forwards (P6 host-port map) |
-| `ct` | HASH (+ `bpf_timer` per elem) | `ct_key` → `ct_entry` | Connection tracking (two entries/flow, §5) |
-| `port_alloc` | ARRAY (bitmap) | word index → 64-bit word | SNAT source-port pool per (proto, host_ip) |
 | `egress_policy` | LPM_TRIE | `{dst_cidr, port}` → verdict | Egress destination ACL (filtering) |
 | `ingress_policy` | LPM_TRIE | `{src_cidr}` → verdict | Ingress source ACL (filtering) |
 | `events` | RINGBUF | — | Flow observability to userspace |
 | `stats` | PERCPU_HASH | `vm_ip` → counters | Per-VM bytes/pkts/drops/conns |
 
-`HASH` (not `LRU_HASH`) for `ct`: LRU evicts silently with no callback, which
-would **leak allocated source ports**. We instead expire entries with
-`bpf_timer` (§5.4), which gives us a callback to free the port and delete the
-sibling entry.
+**No `ct` map and no `port_alloc` map.** Connection state lives in the kernel's
+`nf_conntrack` table, reached via kfuncs (§5). That removes the silent-LRU-eviction
+hazard, the `bpf_timer` expiry machinery, and the source-port bitmap entirely —
+the kernel handles flow GC and unique-tuple allocation.
 
-## 5. Connection tracking (the spine)
+## 5. Connection tracking via kfuncs (the spine)
 
-### 5.1 Entry model — two keys per flow
+We never hand-build a CT map. Each packet looks up the kernel's `nf_conn`; new
+flows are allocated, given a NAT binding, and inserted. The `nf_conn` carries the
+original and reply tuples, so "where does this translate to" is read off the
+entry — no two-keys-per-flow bookkeeping, no manual rewrite tables.
 
-Each connection inserts **two** `ct` entries so a packet from either direction
-finds it directly:
+**kfunc vocabulary** (all release the ref with `bpf_ct_release` before return):
 
-- **Original key** = the tuple as first seen (egress: `VM_IP:sport → DST:dport`;
-  inbound: `REMOTE:sport → HOST_IP:host_port`).
-- **Reply key** = the tuple of return packets *as they arrive* (egress reply:
-  `DST:dport → HOST_IP:aport`; inbound reply from VM: `VM_IP:vm_port → REMOTE:sport`).
+- `bpf_skb_ct_lookup(skb, tuple, sz, opts, sz)` → existing `nf_conn *` or NULL
+- `bpf_skb_ct_alloc(...)` → new uncommitted `nf_conn *`
+- `bpf_ct_set_nat_info(nfct, &addr, port, NF_NAT_MANIP_SRC|_DST)` → reserve a
+  unique manip tuple (this is the source-port allocator)
+- `bpf_ct_set_timeout` / `bpf_ct_set_status`, then `bpf_ct_insert_entry(nfct)`
 
-Each entry carries the **rewrite to apply** to packets matching that key, plus
-the **sibling key** (so refresh/expiry updates both) and shared-ish state
-(refreshed on both). Value sketch:
+The `bpf_ct_opts` carries `dir` so a lookup tells you whether the packet is in the
+**original** or **reply** direction of its flow — that's how each hook decides
+which way to rewrite. Because we steer with `tc` redirect (bypassing the netfilter
+NAT hooks), the kernel does **not** mangle the packet; we read the relevant
+tuple off the `nf_conn` and do the rewrite + checksum fixups (§7) ourselves.
 
-```c
-struct ct_entry {
-    __u32 new_saddr, new_daddr;   // rewrite targets (0 = leave)
-    __u16 new_sport, new_dport;
-    struct ct_key sibling;        // the other direction's key
-    __u64 last_seen_ns;
-    __u32 stats_idx;              // vm_ip for counters
-    __u8  proto, tcp_state, flags;
-    struct bpf_timer timer;
-};
-```
-
-### 5.2 Egress (new outbound) — `nat_tap`
+### 5.1 Egress (VM → internet) — `nat_tap`
 
 1. Parse; `egress_policy` lookup on `dst_ip/dport` → deny ⇒ drop + obs.
-2. `ct` lookup on `{VM_IP:sport, DST:dport}`.
-   - **Hit** ⇒ reuse the entry's `aport`; refresh timer.
-   - **Miss** ⇒ allocate `aport` from `port_alloc` (§5.3); insert original key
-     `{VM_IP:sport,DST:dport}`→rewrite(src→`HOST_IP:aport`) and reply key
-     `{DST:dport,HOST_IP:aport}`→rewrite(dst→`VM_IP:sport`); arm timer.
+2. `bpf_skb_ct_lookup` on the VM-native tuple.
+   - **Miss** ⇒ `bpf_skb_ct_alloc`; `bpf_ct_set_nat_info(NF_NAT_MANIP_SRC,
+     HOST_IP, 0)` (port 0 ⇒ kernel picks a free source port); set timeout/status;
+     `bpf_ct_insert_entry`. Re-read to get the allocated `aport`.
+   - **Hit (original dir)** ⇒ read `aport` from the entry's reply tuple.
+   - **Hit (reply dir)** ⇒ this is actually a reply to an *inbound* flow (§5.3);
+     un-DNAT the source instead.
 3. SNAT rewrite: `src = HOST_IP:aport`; fix IP + L4 checksums (§7).
 4. `bpf_redirect_neigh(uplink_ifindex, NULL, 0, 0)` ⇒ `TC_ACT_REDIRECT`. Kernel
    does FIB + neighbor to the real gateway, fills L2.
-5. Emit obs; bump `stats`.
+5. `bpf_ct_release`; emit obs; bump `stats`.
 
-### 5.3 Reply to egress — `nat_uplink`
+### 5.2 Reply to egress (internet → VM) — `nat_uplink`
 
-1. Parse. `ct` lookup on `{src=DST:dport, dst=HOST_IP:aport}`.
-   - **Hit** ⇒ un-SNAT: `dst = VM_IP:sport`; fix checksums; set L2 `dst=VM_MAC`;
-     `bpf_redirect(tap_ifindex, 0)`; refresh timer; obs.
-   - **Miss** ⇒ fall through to inbound DNAT (§5.5).
+1. Parse. `bpf_skb_ct_lookup` on the packet tuple.
+   - **Hit (reply dir of a SNAT flow)** ⇒ un-SNAT: `dst = VM_IP:sport` (from the
+     entry's original tuple); fix checksums; L2 `dst=VM_MAC` (from `vm_config`);
+     `bpf_redirect(tap_ifindex, 0)`; release; obs.
+   - **Miss** ⇒ fall through to inbound DNAT (§5.3).
 
-### 5.4 Inbound (new) — `nat_uplink`
+### 5.3 Inbound (new, internet → published port) — `nat_uplink`
 
-After a `ct` miss in §5.3:
+After a `ct` miss in §5.2:
 
 1. `dnat_rules` lookup `{proto, HOST_IP, dport}`.
    - **Miss** ⇒ `TC_ACT_OK` (let the host's own stack handle it — host services
      keep working).
    - **Hit** ⇒ `ingress_policy` lookup on `src_ip` → deny ⇒ drop + obs.
-2. Insert CT: original key `{REMOTE:sport, HOST_IP:host_port}`→rewrite(dst→
-   `VM_IP:vm_port`) and reply key `{VM_IP:vm_port, REMOTE:sport}`→rewrite(src→
-   `HOST_IP:host_port`); arm timer.
+2. `bpf_skb_ct_alloc`; `bpf_ct_set_nat_info(NF_NAT_MANIP_DST, VM_IP, vm_port)`;
+   timeout/status; `bpf_ct_insert_entry`.
 3. DNAT rewrite: `dst = VM_IP:vm_port`; fix checksums; L2 `dst=VM_MAC`;
-   `bpf_redirect(tap_ifindex, 0)`; obs.
+   `bpf_redirect(tap_ifindex, 0)`; release; obs.
 
-### 5.5 Reply to inbound (VM → remote) — `nat_tap`
+### 5.4 Reply to inbound (VM → internet) — `nat_tap`
 
-Same hook as egress. The `ct` lookup on `{VM_IP:vm_port, REMOTE:sport}` hits the
-reply key from §5.4 ⇒ un-DNAT source: `src = HOST_IP:host_port`; checksums;
-`bpf_redirect_neigh(uplink)`. So `nat_tap` disambiguates new-egress vs
-reply-to-inbound purely by whether a CT reply-key exists.
+Same hook as egress. The `bpf_skb_ct_lookup` returns the §5.3 flow in the **reply
+direction** (`opts.dir == reply`) ⇒ un-DNAT the source: `src = HOST_IP:host_port`
+(from the original tuple); checksums; `bpf_redirect_neigh(uplink)`; release. So
+`nat_tap` disambiguates new-egress vs reply-to-inbound purely from the lookup's
+direction flag — no extra state of our own.
 
-### 5.6 Expiry & port reclamation (`bpf_timer`)
+### 5.5 Expiry, GC, port reclamation — the kernel's job
 
-Each CT entry arms a `bpf_timer`. Refresh re-arms it (UDP ~30s, TCP-established
-~120s, TCP-SYN ~20s; shorten to ~10s on FIN/RST). On fire, the callback frees the
-`port_alloc` bit (egress flows only) and deletes both this entry and its
-`sibling`. This is the modern (≥5.15) replacement for a userspace GC; a periodic
-Go sweeper is the fallback if `bpf_timer` proves fiddly.
-
-### 5.7 Source-port allocation
-
-Bitmap in `port_alloc` (8 KiB = 65536 bits per proto/host-IP). Lock-free claim:
-scan from a per-CPU cursor, `__sync_fetch_and_or` the candidate bit, succeed if
-the old bit was 0; bounded to N attempts (verifier needs a bounded loop) then
-fail the flow. Allocation is global per (proto, HOST_IP) ⇒ **symmetric NAT**,
-~64k concurrent flows/proto. Freed by the expiry callback.
+Timeouts, the TCP state machine, dead-flow garbage collection, and freeing the
+allocated source port all happen inside `nf_conntrack`. We set an initial timeout
+on insert and otherwise do nothing: no `bpf_timer`, no bitmap, no Go sweeper. Tune
+via the standard `nf_conntrack` sysctls (e.g. `nf_conntrack_tcp_timeout_*`) if the
+defaults don't suit; that's configuration, not rules.
 
 ## 6. ARP / gateway resolution
 
@@ -230,7 +231,9 @@ concern.
   `tapfilter` wiring).
 - **Guest config:** publish `VM_IP`/`GW_IP`/route via MMDS runspec; extend
   `cmd/init/net_linux.go` to apply them (+ static gateway neighbor per §6).
-- **Obs:** drain `events`, export metrics; optional CT sweeper fallback.
+- **Obs:** drain `events`, export metrics. (No CT sweeper — the kernel GCs flows.)
+- **Preflight:** ensure `nf_conntrack` is loaded (`modprobe nf_conntrack`) at agent
+  start and fail fast with a clear error if the kfuncs aren't available.
 
 ## 10. Edge cases & risks (call out before building)
 
@@ -239,33 +242,42 @@ concern.
   fragments** (+ obs) and revisit.
 - **ICMP:** echo needs ID-based NAT; ICMP errors embed the original packet whose
   inner tuple must also be rewritten. Phase 2 — start with TCP/UDP only.
-- **TCP state:** start with a coarse state subset (SYN / established / FIN-RST
-  timeouts); full RFC tracking later. Out-of-state packets get the default
-  timeout, not rejection, initially.
-- **Port exhaustion:** ~64k/proto/host-IP; emit a stat and drop+log on
-  exhaustion rather than silently misbehaving.
-- **CT insert races:** two packets of one new flow on different CPUs — insert
-  with `BPF_NOEXIST`, on `-EEXIST` re-lookup and reuse.
+- **TCP state & port allocation:** handled by `nf_conntrack` (the reason we
+  reuse it). Nothing to build; just confirm the conntrack TCP timeouts suit us.
+- **`nf_conntrack` must be enabled/loaded:** the kfuncs need the module present
+  and conntrack active in the netns. This is a *module + sysctls* dependency, not
+  iptables/nftables rules — consistent with the "no rules" constraint. Preflight
+  and fail fast (§9).
+- **We still rewrite the packet ourselves:** bypassing the netfilter NAT hooks via
+  `tc` redirect means the kernel won't mangle; the kfuncs give us the tuple +
+  state, the eBPF code applies it. Validate the read-tuple-then-rewrite flow in
+  the Phase-1 spike.
+- **kfunc availability:** `bpf_skb_ct_lookup`/`bpf_ct_release` since 5.19; the
+  alloc/insert/`set_nat_info` family since 6.1 — fine on the ≥6.6 target, but it
+  pins the minimum kernel.
+- **CT lookup/insert races:** two packets of one new flow on different CPUs — the
+  loser's `bpf_ct_insert_entry` fails; re-lookup and use the winner's entry.
 - **Checksum offload (virtio):** §7 — verify first.
 - **Host's own traffic:** `nat_uplink` must `TC_ACT_OK` on CT+DNAT miss so host
   services and SSH keep working.
 - **Verifier limits:** tail-call split; bounded loops everywhere.
 - **Capabilities/kernel:** needs `CAP_BPF`+`CAP_NET_ADMIN` (+ `CAP_SYS_ADMIN` for
-  pinning), BTF (`CONFIG_DEBUG_INFO_BTF=y`), kernel ≥ 6.6.
+  pinning), BTF (`CONFIG_DEBUG_INFO_BTF=y`), `CONFIG_NF_CONNTRACK`, kernel ≥ 6.6.
 
 ## 11. Build phases
 
 0. **Addressing + guest config + gateway ARP** — VM gets an IP, default route,
    reaches the gateway. (Prerequisite; nothing routes without it.)
-1. **Egress conntrack + SNAT + reply** — VM reaches the internet. No filtering.
+1. **kfunc conntrack spike + egress SNAT + reply** — prove the
+   lookup/alloc/`set_nat_info`/insert → read-tuple → rewrite + checksum flow on
+   the real virtio path; VM reaches the internet. No filtering.
 2. **Inbound DNAT + VM-reply un-DNAT** — published host-port → VM:25565 works.
 3. **Filtering + observability** — egress/ingress ACLs, ringbuf, stats.
-4. **Expiry (`bpf_timer`) + port reclamation + TCP state subset.**
-5. **Hardening** — ICMP, fragmentation, exhaustion handling, checksum-offload
+4. **Hardening** — ICMP, fragmentation, conntrack-timeout tuning, checksum-offload
    validation.
 
 Each phase is independently testable end-to-end (curl from guest for 1; external
-client → host_port for 2).
+client → host_port for 2). Flow expiry/GC needs no phase — it's the kernel's.
 
 ## 12. Relationship to existing code
 
