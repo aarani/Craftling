@@ -72,6 +72,8 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 		bootArgs: r.cfg.BootArgs,
 		vcpus:    spec.CPUs,
 		memoryMB: spec.MemoryMB,
+		runSpec:  spec.RunSpec,
+		tapName:  tapNameFor(id),
 	}
 	if err := m.boot(ctx); err != nil {
 		_ = os.RemoveAll(dir)
@@ -127,6 +129,12 @@ func (r *Runtime) Deprovision(_ context.Context, vmID string) error {
 		return nil
 	}
 	m.kill()
+	if m.runSpec != nil {
+		// Best-effort: the MMDS TAP outlives the Firecracker process, so
+		// destroy it here. A failure only leaks a host device; it must
+		// not block teardown of the VM's working directory.
+		_ = deleteTAP(m.tapName)
+	}
 	if err := os.RemoveAll(m.dir); err != nil {
 		return fmt.Errorf("firecracker: remove vm dir: %w", err)
 	}

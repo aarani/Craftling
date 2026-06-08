@@ -21,6 +21,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install squashfs-tools
+        # Provides `unsquashfs`, used by the squashfs writer's and image
+        # pipeline's external-validator tests. They skip cleanly when it
+        # is absent, so without this step they'd silently no-op and stop
+        # catching on-wire format regressions.
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+
       - name: Download dependencies
         run: go mod download
 
@@ -41,3 +48,67 @@ jobs:
       # ubuntu-latest ships with Docker, so testcontainers can start Postgres.
       - name: End-to-end tests
         run: go test -tags e2e -count=1 ./test/e2e/...
+
+  # Boots a real Firecracker microVM from a squashfs rootfs built by
+  # internal/image, with cmd/init as PID 1, and asserts the in-VM init
+  # fetched its env from MMDS (see internal/agent/firecracker, the
+  # `kvm`-tagged TestKVMMMDSEnvRoundTrip). The test skips cleanly when a
+  # runner has no /dev/kvm, so this job stays green on runners without
+  # nested virtualization.
+  firecracker-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Enable KVM group perms
+        # Default udev rules give /dev/kvm to the kvm group only; the
+        # test process (root via sudo) is fine, but normalize to 0666 so
+        # the firecracker child can open it regardless of group.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "no /dev/kvm on this runner; the e2e test will skip"
+
+      - name: Install firecracker
+        run: |
+          set -euo pipefail
+          VERSION=v1.15.1
+          ARCH=$(uname -m)
+          curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/${VERSION}/firecracker-${VERSION}-${ARCH}.tgz" \
+            -o /tmp/fc.tgz
+          mkdir -p /tmp/fc && tar -xzf /tmp/fc.tgz -C /tmp/fc
+          sudo install -m 0755 "/tmp/fc/release-${VERSION}-${ARCH}/firecracker-${VERSION}-${ARCH}" /usr/local/bin/firecracker
+          firecracker --version
+
+      - name: Download test kernel
+        # Firecracker's CI vmlinux boots a squashfs root and has
+        # virtio-net (for MMDS); cmd/init configures eth0 itself so we
+        # don't depend on the kernel's CONFIG_IP_PNP.
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          mkdir -p /tmp/fcassets
+          curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/${ARCH}/vmlinux-6.1.155" \
+            -o /tmp/fcassets/vmlinux
+          ls -l /tmp/fcassets/vmlinux
+
+      - name: Run firecracker MMDS e2e
+        # sudo -E because the MMDS tap needs CAP_NET_ADMIN; pass PATH so
+        # `go` resolves and reuse the runner's module cache.
+        env:
+          FC_BINARY: /usr/local/bin/firecracker
+          FC_KERNEL: /tmp/fcassets/vmlinux
+        run: |
+          sudo -E env "PATH=$PATH" \
+            go test -tags kvm -count=1 -v -timeout=15m \
+              -run TestKVMMMDSEnvRoundTrip \
+              ./internal/agent/firecracker/...

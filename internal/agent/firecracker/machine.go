@@ -12,6 +12,7 @@ import (
 
 	fcclient "github.com/aarani/craftling-go/internal/firecracker/client/operations"
 	fcmodels "github.com/aarani/craftling-go/internal/firecracker/models"
+	"github.com/aarani/craftling-go/internal/runspec"
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
 )
@@ -31,6 +32,12 @@ type machine struct {
 	bootArgs string
 	vcpus    int
 	memoryMB int
+
+	// runSpec, when non-nil, is published into this VM's MMDS at boot for
+	// the in-VM init agent to fetch. tapName is the host TAP backing the
+	// MMDS network interface (only created when runSpec is set).
+	runSpec *runspec.RunSpec
+	tapName string
 
 	cmd *exec.Cmd
 	api fcclient.ClientService
@@ -93,7 +100,7 @@ func (m *machine) configure(ctx context.Context) error {
 
 	kernel := m.kernel
 	if _, err := m.api.PutGuestBootSource(fcclient.NewPutGuestBootSourceParamsWithContext(ctx).
-		WithBody(&fcmodels.BootSource{KernelImagePath: &kernel, BootArgs: m.bootArgs})); err != nil {
+		WithBody(&fcmodels.BootSource{KernelImagePath: &kernel, BootArgs: m.effectiveBootArgs()})); err != nil {
 		return fmt.Errorf("boot source: %w", err)
 	}
 
@@ -108,6 +115,12 @@ func (m *machine) configure(ctx context.Context) error {
 			PathOnHost:   m.rootfs,
 		})); err != nil {
 		return fmt.Errorf("root drive: %w", err)
+	}
+
+	// Publish the run spec via MMDS for the in-VM init agent. No-op when
+	// this VM has no run spec (e.g. the legacy ext4 image path).
+	if err := m.configureMMDS(ctx); err != nil {
+		return fmt.Errorf("mmds: %w", err)
 	}
 	return nil
 }

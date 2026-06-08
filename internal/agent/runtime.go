@@ -11,6 +11,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/aarani/craftling-go/internal/runspec"
 	"github.com/google/uuid"
 )
 
@@ -39,6 +40,14 @@ type VMSpec struct {
 	Version  string `json:"version"`
 	CPUs     int    `json:"cpus"`
 	MemoryMB int    `json:"memory_mb"`
+
+	// RunSpec is the OCI-derived command/env/workdir the guest init
+	// agent should exec, distilled by internal/image at image-pull time.
+	// When set, the Firecracker driver publishes it into the VM's MMDS at
+	// boot and the in-VM init fetches it from there (see cmd/init). When
+	// nil — e.g. the legacy ext4 image path that has its own init — the
+	// driver boots the VM with no MMDS and no extra network interface.
+	RunSpec *runspec.RunSpec `json:"run_spec,omitempty"`
 }
 
 // VM is a runtime instance and its observed state. It is also the JSON the agent
