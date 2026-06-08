@@ -34,7 +34,12 @@ func createTAP(name string) error {
 	if err := unix.IoctlSetInt(fd, unix.TUNSETPERSIST, 1); err != nil {
 		return fmt.Errorf("TUNSETPERSIST: %w", err)
 	}
-	return bringUp(name)
+	if err := bringUp(name); err != nil {
+		return err
+	}
+	// Optionally attach the tapfilter eBPF program (observe/drop a single
+	// port). No-op unless CRAFTLING_TAP_FILTER_PORT is set.
+	return maybeAttachTAPFilter(name)
 }
 
 // bringUp sets the IFF_UP flag on the named interface.
@@ -72,6 +77,10 @@ func deleteTAP(name string) error {
 	if err != nil {
 		return fmt.Errorf("ifreq %q: %w", name, err)
 	}
+	// Tear down any eBPF filter first so its TCX links and maps are released
+	// before the device disappears.
+	detachTAPFilter(name)
+
 	ifr.SetUint16(unix.IFF_TAP | unix.IFF_NO_PI)
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
 		// ENODEV means it's already gone; treat as success.
