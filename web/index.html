@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Craftling — Firecracker microVM Minecraft hosting</title>
-<meta name="description" content="Craftling is a control plane for multi-host, Firecracker-microVM Minecraft hosting with durable world storage and a desired-state reconciler." />
+<meta name="description" content="Craftling is a control plane for multi-host, Firecracker-microVM Minecraft hosting — per-VM eBPF NAT networking, durable world storage, and a desired-state reconciler." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -361,7 +361,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
     </div>
     <div class="hero-meta">
       <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.7l7 2.6v5.4c0 4.3-2.9 7.6-7 9-4.1-1.4-7-4.7-7-9V5.3z"/></svg>Hardware-isolated microVMs</span>
-      <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 4 13.5h7l-1 8 9-11h-7z"/></svg>2-second reconcile loop</span>
+      <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 4 13.5h7l-1 8 9-11h-7z"/></svg>Per-VM eBPF NAT — no bridge, no iptables</span>
       <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/></svg>Durable world storage</span>
     </div>
   </div>
@@ -406,6 +406,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
       <span class="tech"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2.5 4 13.5h7l-1 8 9-11h-7z"/></svg>Firecracker</span>
       <span class="tech"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3a13 13 0 0 1 0 18M12 3a13 13 0 0 0 0 18M3.5 12h17"/></svg>Go control plane</span>
       <span class="tech"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>S3-compatible storage</span>
+      <span class="tech"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 1.5v3M15 1.5v3M9 19.5v3M15 19.5v3M1.5 9h3M1.5 15h3M19.5 9h3M19.5 15h3"/></svg>eBPF dataplane</span>
       <span class="tech"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>PostgreSQL</span>
     </div>
   </div>
@@ -424,7 +425,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
         <div class="fic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 3v6h-6M3 21v-6h6M20.5 14a8.5 8.5 0 0 1-15.6 3.5M3.5 10A8.5 8.5 0 0 1 19.1 6.5"/></svg></div>
         <h3>Desired-state reconciler</h3>
         <p>Every two seconds, Craftling diffs what you asked for against what's actually running and converges the gap — the single writer of all compute side effects.</p>
-        <div class="tags"><span class="ftag">desired vs observed</span><span class="ftag">2s loop</span></div>
+        <div class="tags"><span class="ftag">desired vs observed</span><span class="ftag">single writer</span></div>
       </div>
       <div class="fcard reveal">
         <div class="fic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2.7l7 2.6v5.4c0 4.3-2.9 7.6-7 9-4.1-1.4-7-4.7-7-9V5.3z"/><path d="M9 12l2 2 4-4"/></svg></div>
@@ -451,10 +452,10 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
         <div class="tags"><span class="ftag">per-server key</span><span class="ftag">safe reschedule</span></div>
       </div>
       <div class="fcard reveal">
-        <div class="fic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l2.5-7 4 16 2.5-9H21"/></svg></div>
-        <h3>Deep health & metrics</h3>
-        <p>Agents probe the actual Minecraft process over RCON and Server-List-Ping — player count, MOTD, liveness — surfaced alongside Prometheus metrics.</p>
-        <div class="tags"><span class="ftag">RCON</span><span class="ftag">/metrics</span></div>
+        <div class="fic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M3.5 12h17M12 3a13 13 0 0 1 0 18M12 3a13 13 0 0 0 0 18"/></svg></div>
+        <h3>eBPF networking & flow telemetry</h3>
+        <p>Each VM gets a private IP and a published host port — SNAT out, DNAT in — on an eBPF/TCX dataplane riding kernel <span class="mono" style="font-size:13px">nf_conntrack</span>. No Linux bridge, no iptables. Every flow emits an event; per-VM byte, packet, and drop counters stream to Prometheus.</p>
+        <div class="tags"><span class="ftag">per-VM SNAT/DNAT</span><span class="ftag">nf_conntrack kfuncs</span><span class="ftag">per-flow events</span></div>
       </div>
     </div>
   </div>
@@ -529,7 +530,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
         <p>Runs on each KVM host. Owns the microVM runtime; reports status up.</p>
         <div class="acomp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2.5 4 13.5h7l-1 8 9-11h-7z"/></svg>Firecracker runtime<span class="mono">jailer</span></div>
         <div class="acomp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M5 12.5l4.5 4.5L19.5 7"/></svg>Health probes<span class="mono">RCON</span></div>
-        <div class="acomp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/></svg>Networking · NAT<span class="mono">DNAT</span></div>
+        <div class="acomp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/></svg>eBPF NAT dataplane<span class="mono">nf_ct</span></div>
       </div>
       <div class="alayer">
         <div class="tier">// state</div>
@@ -553,7 +554,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
     <div class="shead center reveal">
       <span class="eyebrow"><span class="dot"></span>Roadmap</span>
       <h2>From control plane to production fleet</h2>
-      <p>A phased path, each milestone anchored to real code and verified end-to-end. The control plane, host fleet, scheduler, and agent split have shipped — the Firecracker runtime is next.</p>
+      <p>A phased path, each milestone anchored to real code and verified end-to-end. The control plane, fleet, scheduler, agent split, Firecracker runtime, and an eBPF NAT dataplane have shipped — world persistence is landing next.</p>
     </div>
     <div class="road">
       <div class="phase done reveal"><div class="pid"><span class="p">Foundation</span><span class="chk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12.5l4.5 4.5L19.5 7"/></svg></span></div><h4>Control plane</h4><p>Auth, roles, owner-scoped CRUD, the reconciler, and the Provisioner seam — shipped and e2e-tested.</p></div>
@@ -563,7 +564,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
       <div class="phase done reveal"><div class="pid"><span class="p">P3</span><span class="chk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12.5l4.5 4.5L19.5 7"/></svg></span></div><h4>Agent split</h4><p>A dedicated host-agent binary and a RemoteProvisioner — the reconciler's call becomes a network hop.</p></div>
       <div class="phase done reveal"><div class="pid"><span class="p">P4</span><span class="chk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12.5l4.5 4.5L19.5 7"/></svg></span></div><h4>Firecracker runtime</h4><p>Real microVMs from a versioned Minecraft rootfs — kernel + JRE + server jar, RCON enabled.</p></div>
       <div class="phase reveal"><div class="pid"><span class="p">P5</span><span class="pnow">in progress</span></div><h4>World persistence</h4><p>A WorldStore interface with an S3 impl; pull at boot, flush on stop, safe to reschedule.</p></div>
-      <div class="phase reveal"><div class="pid"><span class="p">P6&nbsp;·&nbsp;P7</span></div><h4>Networking & health</h4><p>Per-VM tap + port allocation so players connect; RCON/SLP probes and Prometheus metrics.</p></div>
+      <div class="phase done reveal"><div class="pid"><span class="p">P6&nbsp;·&nbsp;P7</span><span class="chk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12.5l4.5 4.5L19.5 7"/></svg></span></div><h4>Networking & health</h4><p>Per-VM eBPF SNAT/DNAT over nf_conntrack — no bridge, no iptables — with host-port publish, egress/ingress ACLs, per-flow telemetry, and RCON/SLP probes.</p></div>
       <div class="phase reveal"><div class="pid"><span class="p">P8</span></div><h4>Reliability</h4><p>Retry with backoff, host-failure rescheduling with fencing, draining, and optional leader election.</p></div>
       <div class="phase reveal"><div class="pid"><span class="p">P9</span></div><h4>Quotas</h4><p>Per-user limits on servers, vCPU, and memory — enforced at create and update.</p></div>
       <div class="phase reveal"><div class="pid"><span class="p">P10</span></div><h4>Hardening & ops</h4><p>Agent-to-plane mTLS, secrets management, isolation review, and the split deploy topology.</p></div>
@@ -702,6 +703,7 @@ footer{border-top:1px solid var(--border-soft);padding:46px 0 40px;margin-top:10
           <h5>Stack</h5>
           <a href="#">Firecracker</a>
           <a href="#">Go</a>
+          <a href="#">eBPF dataplane</a>
           <a href="#">PostgreSQL</a>
           <a href="#">S3 storage</a>
         </div>
