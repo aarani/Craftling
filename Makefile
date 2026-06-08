@@ -1,4 +1,4 @@
-.PHONY: run run-agent build build-agent test test-e2e test-kvm tidy fmt bpf-generate
+.PHONY: run run-agent build build-agent test test-e2e test-kvm test-bpf tidy fmt bpf-generate
 
 run:
 	go run ./cmd/server
@@ -26,6 +26,13 @@ test-e2e:
 #   FC_KERNEL=... FC_IMAGE_DIR=... FC_DEFAULT_IMAGE=base.ext4 make test-kvm
 test-kvm:
 	go test -tags kvm -count=1 -v ./internal/agent/firecracker/...
+
+# Loads the real eBPF NAT/tapfilter objects into the running kernel, attaches
+# them to veth/tap devices, and drives packets through them. Needs root (CAP_BPF
+# + CAP_NET_ADMIN), `ip`, and a kernel >= 6.6 (TCX + nf_conntrack kfuncs); the
+# tests skip cleanly otherwise. No firecracker/KVM required — `sudo make test-bpf`.
+test-bpf:
+	sudo env "PATH=$$PATH" go test -tags bpf -count=1 -v ./internal/agent/firecracker/...
 
 # Regenerate the eBPF bindings + compiled objects from the .c sources. This is a
 # MAINTAINER step, run on a Linux >=6.6 host with clang, libbpf headers, and

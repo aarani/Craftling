@@ -49,6 +49,34 @@ jobs:
       - name: End-to-end tests
         run: go test -tags e2e -count=1 ./test/e2e/...
 
+  # Loads the real eBPF NAT + tapfilter objects into the runner's kernel,
+  # attaches them to veth/tap devices, and drives packets through them (the
+  # `bpf`-tagged e2e in internal/agent/firecracker). This catches verifier
+  # regressions, conntrack kfunc-resolution failures, and userspace<->kernel
+  # struct drift that the unit tests can't. No KVM/firecracker needed — just
+  # root and a kernel >= 6.6 (ubuntu-latest runners qualify); the tests skip
+  # cleanly on an older kernel. The committed bpf/*_bpfel.o are loaded as-is,
+  # so no clang/bpftool toolchain is required here.
+  ebpf-dataplane-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run eBPF dataplane e2e
+        # sudo for CAP_BPF + CAP_NET_ADMIN; pass PATH so `go` resolves and reuse
+        # the runner's module cache.
+        run: |
+          sudo env "PATH=$PATH" \
+            go test -tags bpf -count=1 -v -timeout=10m \
+              ./internal/agent/firecracker/...
+
   # Boots a real Firecracker microVM from a squashfs rootfs built by
   # internal/image, with cmd/init as PID 1, and asserts the in-VM init
   # fetched its env from MMDS (see internal/agent/firecracker, the
