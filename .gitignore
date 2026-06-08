@@ -19,3 +19,10 @@ coverage.out
 
 # AI
 .claude/
+
+# eBPF: the bpf2go-generated bindings/objects and vmlinux.h are intentionally
+# committed (regenerated via `make bpf-generate` on a Linux host) so the project
+# builds with only the Go toolchain. Keep them tracked even if a broad *.o rule
+# is ever added above.
+!internal/agent/firecracker/bpf/*.o
+!internal/agent/firecracker/bpf/vmlinux.h

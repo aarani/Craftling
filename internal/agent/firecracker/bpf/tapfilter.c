@@ -13,6 +13,7 @@
 // direction, so ingress==1 means "guest transmitted this".
 
 #include <linux/bpf.h>
+#include <linux/in.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
@@ -49,6 +50,11 @@ struct event {
 	__u8 proto;   // IPPROTO_TCP / IPPROTO_UDP
 	__u8 _pad[3];
 };
+
+// Force struct event into BTF: it is only used as a local (the ringbuf carries
+// it untyped), so without a reachable reference clang would prune it and
+// bpf2go's `-type event` lookup would fail.
+struct event *_unused_event __attribute__((unused));
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);

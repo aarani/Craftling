@@ -39,6 +39,14 @@ type machine struct {
 	runSpec *runspec.RunSpec
 	tapName string
 
+	// dp, net, and servicePort are set only when the NAT dataplane is enabled
+	// and this VM has a runSpec. dp is the shared eBPF collection; net is this
+	// VM's allocated addressing; servicePort is the in-VM service port the
+	// public host port DNATs to.
+	dp          *natDataplane
+	net         vmNet
+	servicePort uint16
+
 	cmd *exec.Cmd
 	api fcclient.ClientService
 }
