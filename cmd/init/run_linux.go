@@ -82,6 +82,19 @@ func run(logger *zap.Logger) {
 	if err != nil {
 		logger.Fatal("init: fetch run spec from mmds", zap.Error(err))
 	}
+
+	// Apply per-VM networking (private address, gateway neighbor, default
+	// route) once we have the spec, so the workload can reach the internet
+	// through the host's NAT dataplane. Absent on MMDS-only hosts.
+	if spec.Net != nil {
+		if err := applyNetConfig(spec.Net); err != nil {
+			logger.Fatal("init: apply network config", zap.Error(err))
+		}
+		logger.Info("init: network configured",
+			zap.String("address", spec.Net.Address),
+			zap.String("gateway", spec.Net.Gateway))
+	}
+
 	argv := spec.Argv()
 	if len(argv) == 0 {
 		logger.Fatal("init: run spec has no entrypoint or cmd")

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/aarani/craftling-go/internal/agent"
+	"github.com/aarani/craftling-go/internal/runspec"
 	"github.com/google/uuid"
 )
 
@@ -17,6 +18,12 @@ import (
 // rootfs images. It is safe for concurrent use by the agent HTTP server.
 type Runtime struct {
 	cfg Config
+
+	// dp and ipam are non-nil only when the NAT dataplane is enabled
+	// (cfg.UplinkDevice set). dp is the shared eBPF collection loaded once;
+	// ipam hands out per-VM addresses and host ports.
+	dp   *natDataplane
+	ipam *ipam
 
 	mu  sync.Mutex
 	vms map[string]*machine
@@ -34,7 +41,37 @@ func New(cfg Config) (*Runtime, error) {
 	if err := os.MkdirAll(cfg.WorkDir, 0o750); err != nil {
 		return nil, fmt.Errorf("firecracker: work dir: %w", err)
 	}
-	return &Runtime{cfg: cfg, vms: make(map[string]*machine)}, nil
+
+	r := &Runtime{cfg: cfg, vms: make(map[string]*machine)}
+
+	// Bring up the shared eBPF NAT dataplane once, here, when an uplink is
+	// configured. A failure is fatal: a half-networked host would boot VMs that
+	// can't reach the internet, which is worse than refusing to start.
+	if cfg.natEnabled() {
+		dc, err := cfg.dataplaneConfig()
+		if err != nil {
+			return nil, err
+		}
+		ip, err := newIPAM(dc.subnet, dc.gatewayIP, dc.gatewayMAC, dc.portMin, dc.portMax)
+		if err != nil {
+			return nil, err
+		}
+		dp, err := newDataplane(dc)
+		if err != nil {
+			return nil, err
+		}
+		r.dp = dp
+		r.ipam = ip
+	}
+	return r, nil
+}
+
+// Close tears down the NAT dataplane (detaching all eBPF programs). It is safe
+// to call when the dataplane was never enabled.
+func (r *Runtime) Close() {
+	if r.dp != nil {
+		r.dp.Close()
+	}
 }
 
 // Provision creates a per-VM working dir + writable rootfs and boots a microVM.
@@ -61,21 +98,50 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 		return nil, fmt.Errorf("firecracker: stage rootfs: %w", err)
 	}
 
+	runSpec := spec.RunSpec
+	var vmnet vmNet
+	// The NAT dataplane needs the in-VM init agent to apply per-VM addressing,
+	// which only exists on the MMDS/runspec path. Legacy ext4 VMs (no runspec)
+	// stay MMDS-only even when the dataplane is enabled for other VMs.
+	if r.dp != nil && runSpec != nil {
+		n, err := r.ipam.allocate()
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
+		vmnet = n
+		// Copy the caller's runspec and attach the guest network config so we
+		// never mutate a shared/caller-owned struct.
+		rs := *runSpec
+		rs.Net = &runspec.NetConfig{
+			Interface:  runspec.MMDSInterface,
+			Address:    vmnet.VMIP.String(),
+			PrefixLen:  vmnet.PrefixLen,
+			Gateway:    vmnet.GatewayIP.String(),
+			GatewayMAC: vmnet.GatewayMAC.String(),
+		}
+		runSpec = &rs
+	}
+
 	m := &machine{
-		id:       id,
-		serverID: spec.ServerID,
-		dir:      dir,
-		socket:   filepath.Join(dir, "firecracker.sock"),
-		rootfs:   rootfs,
-		kernel:   r.cfg.KernelPath,
-		binary:   r.cfg.BinaryPath,
-		bootArgs: r.cfg.BootArgs,
-		vcpus:    spec.CPUs,
-		memoryMB: spec.MemoryMB,
-		runSpec:  spec.RunSpec,
-		tapName:  tapNameFor(id),
+		id:          id,
+		serverID:    spec.ServerID,
+		dir:         dir,
+		socket:      filepath.Join(dir, "firecracker.sock"),
+		rootfs:      rootfs,
+		kernel:      r.cfg.KernelPath,
+		binary:      r.cfg.BinaryPath,
+		bootArgs:    r.cfg.BootArgs,
+		vcpus:       spec.CPUs,
+		memoryMB:    spec.MemoryMB,
+		runSpec:     runSpec,
+		tapName:     tapNameFor(id),
+		dp:          r.dp,
+		net:         vmnet,
+		servicePort: defaultMinecraftPort,
 	}
 	if err := m.boot(ctx); err != nil {
+		r.releaseNet(vmnet)
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("firecracker: boot vm: %w", err)
 	}
@@ -130,9 +196,14 @@ func (r *Runtime) Deprovision(_ context.Context, vmID string) error {
 	}
 	m.kill()
 	if m.runSpec != nil {
-		// Best-effort: the MMDS TAP outlives the Firecracker process, so
-		// destroy it here. A failure only leaks a host device; it must
-		// not block teardown of the VM's working directory.
+		// Detach the dataplane and release the VM's address/port before the
+		// TAP disappears. Best-effort: the MMDS TAP outlives the Firecracker
+		// process, so destroy it here too. A failure only leaks a host device;
+		// it must not block teardown of the VM's working directory.
+		if r.dp != nil {
+			r.dp.withdrawVM(m.tapName, m.net)
+			r.releaseNet(m.net)
+		}
 		_ = deleteTAP(m.tapName)
 	}
 	if err := os.RemoveAll(m.dir); err != nil {
@@ -153,18 +224,32 @@ func (r *Runtime) Status(_ context.Context, vmID string) (*agent.VM, error) {
 	return r.vmView(m), nil
 }
 
+// releaseNet returns a VM's address/port to the IPAM pool. No-op when the
+// dataplane is disabled or the vmNet is empty.
+func (r *Runtime) releaseNet(n vmNet) {
+	if r.ipam != nil {
+		r.ipam.release(n)
+	}
+}
+
 // vmView renders a machine as the agent.VM the API returns, deriving state from
-// process liveness.
+// process liveness. With the NAT dataplane the connect endpoint is the host's
+// advertise address and the VM's IPAM-allocated public host port; otherwise it
+// falls back to the standard in-VM port.
 func (r *Runtime) vmView(m *machine) *agent.VM {
 	state := agent.StateStopped
 	if m.running() {
 		state = agent.StateRunning
 	}
+	port := defaultMinecraftPort
+	if r.dp != nil && m.net.HostPort != 0 {
+		port = int(m.net.HostPort)
+	}
 	return &agent.VM{
 		ID:       m.id,
 		ServerID: m.serverID,
 		Host:     r.cfg.AdvertiseHost,
-		Port:     defaultMinecraftPort,
+		Port:     port,
 		State:    state,
 	}
 }

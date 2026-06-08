@@ -16,6 +16,7 @@ package firecracker
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 )
@@ -35,12 +36,43 @@ type Config struct {
 	// WorkDir is where per-VM working directories (sockets, writable rootfs,
 	// logs) live. Defaults to a "craftling-fc" dir under the OS temp dir.
 	WorkDir string
-	// AdvertiseHost is the player-facing connect address VMs report (a stand-in
-	// until P6 derives a real per-VM address from networking).
+	// AdvertiseHost is the player-facing connect address VMs report. With the
+	// eBPF NAT dataplane enabled (UplinkDevice set) this is the host's public
+	// address; the per-server port is the IPAM-allocated host port (see vmNet).
 	AdvertiseHost string
 	// BootArgs overrides the kernel command line. Empty uses DefaultBootArgs.
 	BootArgs string
+
+	// UplinkDevice is the host NIC the NAT dataplane attaches to for egress
+	// SNAT and inbound DNAT (e.g. "eth0", "ens5"). When empty the NAT dataplane
+	// is disabled and VMs get MMDS-only networking as before — every other
+	// dataplane field below is then ignored.
+	UplinkDevice string
+	// VMSubnet is the CIDR private VM addresses are drawn from. Default
+	// DefaultVMSubnet.
+	VMSubnet string
+	// GatewayIP is the shared virtual gateway address VMs route through. It is
+	// never assigned to a host interface (the dataplane redirects, it does not
+	// route). Must fall inside VMSubnet. Empty defaults to the first usable host.
+	GatewayIP string
+	// GatewayMAC is the MAC the guest installs as a static neighbor for
+	// GatewayIP. Default DefaultGatewayMAC.
+	GatewayMAC string
+	// HostPortMin/HostPortMax bound the public host-port pool DNAT'd to in-VM
+	// services. Defaults DefaultHostPortMin/Max.
+	HostPortMin uint16
+	HostPortMax uint16
 }
+
+// Dataplane defaults. The VM subnet is a private RFC1918 block unlikely to
+// clash with host or upstream networks; the gateway MAC is locally-administered
+// (0x02 high byte) so it never collides with a real NIC.
+const (
+	DefaultVMSubnet    = "10.222.0.0/16"
+	DefaultGatewayMAC  = "02:00:00:00:00:01"
+	DefaultHostPortMin = 30000
+	DefaultHostPortMax = 40000
+)
 
 // DefaultBootArgs is a minimal serial-console boot line that mounts the rootfs
 // read-write off the first virtio block device.
@@ -78,7 +110,89 @@ func (c *Config) validate() error {
 	} else if !fi.IsDir() {
 		return fmt.Errorf("firecracker: image dir %q is not a directory", c.ImageDir)
 	}
+	if c.natEnabled() {
+		if err := c.validateDataplane(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// natEnabled reports whether the eBPF NAT dataplane should be wired up. It is
+// gated on UplinkDevice so a host without a configured uplink keeps the legacy
+// MMDS-only behaviour.
+func (c *Config) natEnabled() bool { return c.UplinkDevice != "" }
+
+// validateDataplane fills dataplane defaults and checks the addressing is
+// self-consistent (subnet parses, gateway sits inside it, port range is sane).
+// It is only called when natEnabled.
+func (c *Config) validateDataplane() error {
+	if c.VMSubnet == "" {
+		c.VMSubnet = DefaultVMSubnet
+	}
+	if c.GatewayMAC == "" {
+		c.GatewayMAC = DefaultGatewayMAC
+	}
+	if c.HostPortMin == 0 {
+		c.HostPortMin = DefaultHostPortMin
+	}
+	if c.HostPortMax == 0 {
+		c.HostPortMax = DefaultHostPortMax
+	}
+	// dataplaneConfig does the cross-field validation (parse + containment).
+	_, err := c.dataplaneConfig()
+	return err
+}
+
+// dataplaneConfig parses the addressing fields into a ready-to-use form,
+// defaulting GatewayIP to the first usable host of VMSubnet when unset.
+func (c *Config) dataplaneConfig() (dataplaneConfig, error) {
+	_, subnet, err := net.ParseCIDR(c.VMSubnet)
+	if err != nil {
+		return dataplaneConfig{}, fmt.Errorf("firecracker: VMSubnet %q: %w", c.VMSubnet, err)
+	}
+	gwMAC, err := net.ParseMAC(c.GatewayMAC)
+	if err != nil {
+		return dataplaneConfig{}, fmt.Errorf("firecracker: GatewayMAC %q: %w", c.GatewayMAC, err)
+	}
+	if len(gwMAC) != 6 {
+		return dataplaneConfig{}, fmt.Errorf("firecracker: GatewayMAC %q is not 48-bit", c.GatewayMAC)
+	}
+
+	gwIP := net.ParseIP(c.GatewayIP).To4()
+	if c.GatewayIP == "" {
+		// First usable host = network address + 1.
+		host := append(net.IP(nil), subnet.IP.To4()...)
+		host[3]++
+		gwIP = host
+	}
+	if gwIP == nil {
+		return dataplaneConfig{}, fmt.Errorf("firecracker: GatewayIP %q is not IPv4", c.GatewayIP)
+	}
+	if !subnet.Contains(gwIP) {
+		return dataplaneConfig{}, fmt.Errorf("firecracker: GatewayIP %s not in VMSubnet %s", gwIP, subnet)
+	}
+	if c.HostPortMin == 0 || c.HostPortMax < c.HostPortMin {
+		return dataplaneConfig{}, fmt.Errorf("firecracker: invalid host-port range %d-%d", c.HostPortMin, c.HostPortMax)
+	}
+	return dataplaneConfig{
+		uplink:     c.UplinkDevice,
+		subnet:     subnet,
+		gatewayIP:  gwIP,
+		gatewayMAC: gwMAC,
+		portMin:    c.HostPortMin,
+		portMax:    c.HostPortMax,
+	}, nil
+}
+
+// dataplaneConfig is the validated, parsed form of the NAT addressing knobs.
+type dataplaneConfig struct {
+	uplink     string
+	subnet     *net.IPNet
+	gatewayIP  net.IP
+	gatewayMAC net.HardwareAddr
+	portMin    uint16
+	portMax    uint16
 }
 
 // imageFor resolves the base rootfs image path for a Minecraft version,

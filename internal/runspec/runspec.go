@@ -97,6 +97,33 @@ type RunSpec struct {
 	// WorkingDir is the directory the init agent chdirs into before
 	// exec. Empty means "/".
 	WorkingDir string `json:"working_dir,omitempty"`
+
+	// Net, when non-nil, is the per-VM networking the host's eBPF NAT
+	// dataplane expects the guest to apply on top of the link-local MMDS
+	// address: a private address, a default route through the shared
+	// virtual gateway, and a static neighbor for it (the gateway IP is
+	// never owned by a host interface, so nothing would answer an ARP).
+	// Absent when the host runs MMDS-only (no NAT dataplane).
+	Net *NetConfig `json:"net,omitempty"`
+}
+
+// NetConfig is the guest-applied side of the NAT dataplane addressing. All
+// addresses are dotted-quad IPv4 and the MAC is colon-separated; the in-VM
+// init agent (cmd/init) assigns the address to the data interface, adds a
+// default route via Gateway, and installs Gateway -> GatewayMAC as a permanent
+// ARP entry so the guest never emits an (unanswered) ARP request for it.
+type NetConfig struct {
+	// Interface is the guest NIC to configure. Empty means MMDSInterface
+	// (the data NIC and the MMDS NIC are the same TAP).
+	Interface string `json:"interface,omitempty"`
+	// Address is the guest's private IPv4 (e.g. "10.222.0.5").
+	Address string `json:"address"`
+	// PrefixLen is the address prefix length (e.g. 16).
+	PrefixLen int `json:"prefix_len"`
+	// Gateway is the shared virtual gateway the default route points at.
+	Gateway string `json:"gateway"`
+	// GatewayMAC is the MAC installed as Gateway's permanent neighbor.
+	GatewayMAC string `json:"gateway_mac"`
 }
 
 // Argv returns the full command line (Entrypoint followed by Cmd).

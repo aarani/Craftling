@@ -1,6 +1,13 @@
 # eBPF NAT dataplane (P6 networking)
 
-> **Status:** design / not yet built. This is the spec to review before code lands.
+> **Status:** implemented (all phases), pending on-kernel verification. The
+> datapath and Go plumbing have landed; because the eBPF cannot be compiled or
+> verifier-tested off a Linux ≥6.6 host (same constraint as the existing
+> `tapfilter`, which is kept out of default CI), the conntrack-kfunc flow,
+> checksum-offload behaviour, and verifier acceptance still need validation on a
+> real host. See "Implementation map" at the bottom for where each piece lives.
+>
+> **Original design follows.**
 >
 > **Goal:** give each Firecracker microVM real connectivity using an eBPF
 > datapath — no Linux bridge, and **no `iptables`/`nftables` rules** (the actual
@@ -291,3 +298,40 @@ client → host_port for 2). Flow expiry/GC needs no phase — it's the kernel's
   MMDS runspec publish (`mmds.go`).
 - `Config` gains `UplinkDevice` (and gateway/subnet knobs); `AdvertiseHost`'s
   stand-in is replaced by the real `HOST_IP:host_port` from §9 IPAM.
+
+## Implementation map
+
+The datapath was implemented as a single shared collection alongside the
+existing `tapfilter` (which is left intact — it is a separate, env-gated
+observe/drop feature). The NAT dataplane is enabled only when `Config.UplinkDevice`
+is set; otherwise the driver keeps its MMDS-only behaviour.
+
+| Piece | File |
+|---|---|
+| eBPF programs (`nat_tap`, `nat_uplink`, ARP responder) + maps | `internal/agent/firecracker/bpf/nat.c` |
+| bpf2go directive + `vmlinux.h` instructions | `internal/agent/firecracker/bpf/gen.go` |
+| IPAM (VM IP, deterministic MAC, host port) + `vmNet` | `internal/agent/firecracker/netalloc.go` |
+| Dataplane loader/attach, map population, ringbuf drain, conntrack preflight | `internal/agent/firecracker/nat_linux.go` (stub: `nat_other.go`) |
+| Config knobs (`UplinkDevice`, subnet/gateway/MAC/port range) + validation | `internal/agent/firecracker/config.go` |
+| `Runtime` wiring (load once, allocate/release, publish/withdraw per VM) | `internal/agent/firecracker/runtime.go` |
+| Guest-MAC pinning + per-TAP attach at provision | `internal/agent/firecracker/{machine.go,mmds.go}` |
+| Runspec per-VM `NetConfig` (MMDS contract) | `internal/runspec/runspec.go` |
+| Guest applies address/neighbor/route (hand-rolled rtnetlink) | `cmd/init/{net_linux.go,netlink_linux.go,run_linux.go}` |
+| Unit tests (IPAM, MAC, config parsing) | `internal/agent/firecracker/netalloc_test.go` |
+
+**Before this runs on a host:** run `make bpf-generate` once on a Linux ≥6.6 box
+(needs clang + libbpf + bpftool; it dumps `vmlinux.h` from the host BTF and runs
+bpf2go) and **commit** the resulting `bpf/vmlinux.h`, `bpf/*_bpfel.go`, and
+`bpf/*_bpfel.o`. After that `go build` needs only the Go toolchain — CO-RE makes
+the one compiled object portable across kernels at load time. Then validate the
+conntrack-kfunc flow, checksum offload on the virtio path (§7), and verifier
+acceptance per the Phase-1 spike (§11).
+
+**Deviations from the original sketch:** conntrack uses the two main programs
+calling inlined helpers rather than a tail-call split — the kfunc-based programs
+are small enough that the split (§3) is held as a fallback if the verifier
+rejects the monolith. The MMDS TAP and the NAT'd data NIC are the same device
+(MMDS traffic is intercepted by Firecracker's device model; everything else
+reaches `nat_tap`), so no second NIC is added. The guest gets the §6 *static
+neighbor* for the gateway via the init agent; the eBPF ARP responder is also
+present as a fallback.

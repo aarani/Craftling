@@ -34,6 +34,47 @@ func setupNetwork() error {
 	return nil
 }
 
+// applyNetConfig applies the per-VM networking the host's NAT dataplane
+// expects, on top of the link-local MMDS address already configured: it adds
+// the private VM address as a secondary address, installs a permanent neighbor
+// for the virtual gateway (which no host interface owns, so an ARP would go
+// unanswered), and adds the default route through it. Order matters — the
+// neighbor is installed before the route so the gateway resolves immediately.
+func applyNetConfig(nc *runspec.NetConfig) error {
+	ifaceName := nc.Interface
+	if ifaceName == "" {
+		ifaceName = runspec.MMDSInterface
+	}
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", ifaceName, err)
+	}
+
+	ip := net.ParseIP(nc.Address)
+	if ip == nil {
+		return fmt.Errorf("invalid VM address %q", nc.Address)
+	}
+	gw := net.ParseIP(nc.Gateway)
+	if gw == nil {
+		return fmt.Errorf("invalid gateway %q", nc.Gateway)
+	}
+	mac, err := net.ParseMAC(nc.GatewayMAC)
+	if err != nil {
+		return fmt.Errorf("invalid gateway MAC %q: %w", nc.GatewayMAC, err)
+	}
+
+	if err := addInterfaceAddr(iface.Index, ip, nc.PrefixLen); err != nil {
+		return fmt.Errorf("add address %s/%d: %w", nc.Address, nc.PrefixLen, err)
+	}
+	if err := addNeighbor(iface.Index, gw, mac); err != nil {
+		return fmt.Errorf("add gateway neighbor %s: %w", nc.Gateway, err)
+	}
+	if err := addDefaultRoute(iface.Index, gw); err != nil {
+		return fmt.Errorf("add default route via %s: %w", nc.Gateway, err)
+	}
+	return nil
+}
+
 // setIfaceAddr assigns an IPv4 address and netmask to iface via the
 // classic SIOCSIFADDR / SIOCSIFNETMASK ioctls.
 func setIfaceAddr(sock int, iface, addr, mask string) error {

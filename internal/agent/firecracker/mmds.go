@@ -77,20 +77,37 @@ func (m *machine) configureMMDS(ctx context.Context) error {
 
 	// The host TAP must exist before Firecracker opens it. MMDS does not
 	// need it routed or NATed — the device model answers MMDS traffic
-	// itself — so a bare, up TAP is enough.
+	// itself — so a bare, up TAP is enough. The same TAP carries the VM's
+	// real (NAT'd) traffic: MMDS is intercepted by the device model, every
+	// other packet reaches the host TAP where nat_tap translates it.
 	if err := createTAP(m.tapName); err != nil {
 		return fmt.Errorf("create tap %q: %w", m.tapName, err)
 	}
 
 	ifaceID := mmdsIfaceID
 	host := m.tapName
+	nic := &fcmodels.NetworkInterface{
+		IfaceID:     &ifaceID,
+		HostDevName: &host,
+	}
+	// Pin the guest MAC to the deterministic dataplane MAC so inbound DNAT can
+	// address frames to the VM without learning its MAC.
+	if m.dp != nil && m.net.VMMAC != nil {
+		nic.GuestMac = m.net.VMMAC.String()
+	}
 	if _, err := m.api.PutGuestNetworkInterfaceByID(fcclient.NewPutGuestNetworkInterfaceByIDParamsWithContext(ctx).
 		WithIfaceID(ifaceID).
-		WithBody(&fcmodels.NetworkInterface{
-			IfaceID:     &ifaceID,
-			HostDevName: &host,
-		})); err != nil {
+		WithBody(nic)); err != nil {
 		return fmt.Errorf("network interface: %w", err)
+	}
+
+	// Attach the NAT dataplane to this TAP and publish the VM's maps now that
+	// the device exists. The guest applies its address from the runspec Net
+	// block once it boots and fetches MMDS.
+	if m.dp != nil && m.net.VMMAC != nil {
+		if err := m.dp.publishVM(m.tapName, m.net, m.servicePort); err != nil {
+			return fmt.Errorf("nat dataplane: %w", err)
+		}
 	}
 
 	version := fcmodels.MmdsConfigVersionV2
