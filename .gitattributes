@@ -1,0 +1,7 @@
+# vmlinux.h is a ~3.5 MB auto-generated BTF dump (bpftool btf dump). Exclude it
+# from language stats and collapse it in diffs.
+internal/agent/firecracker/bpf/vmlinux.h linguist-generated
+
+# bpf2go output (see bpf/gen.go): generated Go bindings + compiled objects.
+internal/agent/firecracker/bpf/*_bpfel.go linguist-generated
+internal/agent/firecracker/bpf/*.o linguist-generated binary
