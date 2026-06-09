@@ -40,6 +40,7 @@ func NewRouter(rt Runtime, log *zap.Logger) *gin.Engine {
 		vms.POST("", s.Provision)
 		vms.POST("/:id/start", s.Start)
 		vms.POST("/:id/stop", s.Stop)
+		vms.POST("/:id/snapshot", s.Snapshot)
 		vms.DELETE("/:id", s.Deprovision)
 		vms.GET("/:id", s.Status)
 	}
@@ -81,6 +82,21 @@ func (s *Server) Start(c *gin.Context) {
 func (s *Server) Stop(c *gin.Context) {
 	if err := s.rt.Stop(c.Request.Context(), c.Param("id")); err != nil {
 		logger.FromContext(c).Error("stop vm", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// Snapshot takes an on-demand world snapshot of a running VM (P5c).
+func (s *Server) Snapshot(c *gin.Context) {
+	err := s.rt.Snapshot(c.Request.Context(), c.Param("id"))
+	if errors.Is(err, ErrVMNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "vm not found"})
+		return
+	}
+	if err != nil {
+		logger.FromContext(c).Error("snapshot vm", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}

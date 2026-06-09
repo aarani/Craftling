@@ -3,11 +3,11 @@
 //
 // It drives Firecracker through the in-repo generated REST client
 // (internal/firecracker), spoken over the per-VM API Unix socket, and manages
-// the Firecracker process lifecycle directly. Networking (P6) and world
-// persistence (P5) are deliberately out of scope here: a VM boots from a
-// per-version rootfs with the standard in-VM Minecraft port, and the driver
-// reports the host's advertise address as the connect host until P6 wires real
-// per-VM networking.
+// the Firecracker process lifecycle directly. When WorldPersistence is enabled
+// (P5a) a runspec VM also gets a per-server writable world disk attached as a
+// second drive, which the in-VM init overlays onto WorkingDir so the world
+// survives a stop/start; backup-to-store and cross-host reschedule build on
+// that in P5b/P5c.
 //
 // This package only runs on a Linux host with /dev/kvm; its integration test is
 // gated behind the `kvm` build tag and kept out of the default CI lane.
@@ -18,7 +18,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/aarani/craftling-go/internal/storage"
+	"go.uber.org/zap"
 )
 
 // Config configures the Firecracker Runtime. Paths point at host artifacts
@@ -62,6 +68,48 @@ type Config struct {
 	// services. Defaults DefaultHostPortMin/Max.
 	HostPortMin uint16
 	HostPortMax uint16
+
+	// WorldPersistence enables the per-server writable world disk + guest
+	// overlay (P5a). It applies only to runspec/init VMs — the legacy ext4
+	// image is already a fully writable per-VM copy. When false (the
+	// default) VMs boot with no data disk and a write to WorkingDir lives
+	// in tmpfs (lost on stop). Enabling it requires mkfs.ext4 on the host
+	// and CONFIG_OVERLAY_FS + CONFIG_EXT4_FS in the guest kernel.
+	WorldPersistence bool
+	// DataDir is where per-server world disks live, deliberately separate
+	// from the per-VM WorkDir (which Deprovision wipes) so a world can
+	// survive stop/start and outlive a single VM instance. Defaults to a
+	// "worlds" dir under WorkDir. Only used when WorldPersistence is set.
+	DataDir string
+	// WorldDiskMB is the size of a freshly created world disk. The ext4 is
+	// created sparse, so this is a ceiling, not an upfront allocation.
+	// Default DefaultWorldDiskMB.
+	WorldDiskMB int
+	// MkfsExt4Path is the mkfs.ext4 executable used to format a new world
+	// disk. Defaults to "mkfs.ext4" resolved on PATH.
+	MkfsExt4Path string
+	// WorldStore, when non-nil, is the durable off-host home of world
+	// snapshots (P5b): Provision restores a server's world from it before
+	// boot, Stop snapshots the disk into it, and Deprovision deletes it.
+	// Nil keeps worlds local-only (they survive stop/start on this host but
+	// not delete or reschedule). Only consulted when WorldPersistence is set.
+	WorldStore storage.WorldStore
+
+	// SnapshotInterval, when > 0, turns on periodic application-consistent
+	// snapshots (P5c) of every running VM, bounding crash data-loss to one
+	// interval. Requires a WorldStore. 0 disables the periodic sweep (a live
+	// snapshot can still be taken on demand).
+	SnapshotInterval time.Duration
+	// RCONPort is the in-VM RCON port the guest flushes through before a live
+	// snapshot. Default DefaultRCONPort.
+	RCONPort int
+	// RCONPassword authenticates to the in-VM RCON. Empty means snapshots
+	// freeze the disk without an application flush (filesystem-consistent
+	// only). Shared across the agent's servers for now.
+	RCONPassword string
+	// Logger is used for best-effort background work (the periodic snapshot
+	// sweep). Nil is replaced with a no-op logger.
+	Logger *zap.Logger
 }
 
 // Dataplane defaults. The VM subnet is a private RFC1918 block unlikely to
@@ -72,6 +120,23 @@ const (
 	DefaultGatewayMAC  = "02:00:00:00:00:01"
 	DefaultHostPortMin = 30000
 	DefaultHostPortMax = 40000
+)
+
+// World-persistence defaults (P5a).
+const (
+	// DefaultWorldDiskMB is the size of a freshly created world disk. It is
+	// created sparse, so this caps growth rather than reserving the space.
+	DefaultWorldDiskMB = 4096
+	// defaultMkfsExt4 is the mkfs.ext4 executable resolved on PATH when
+	// MkfsExt4Path is unset.
+	defaultMkfsExt4 = "mkfs.ext4"
+	// worldDriveID is the Firecracker drive id of the per-server world disk.
+	worldDriveID = "world"
+	// worldDevice is the guest block device the world disk surfaces as. The
+	// root squashfs is /dev/vda; the world disk, attached second, is /dev/vdb.
+	worldDevice = "/dev/vdb"
+	// DefaultRCONPort is the in-VM RCON port flushed before a live snapshot.
+	DefaultRCONPort = 25575
 )
 
 // DefaultBootArgs is a minimal serial-console boot line that mounts the rootfs
@@ -115,6 +180,11 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	if c.persistEnabled() {
+		if err := c.validatePersistence(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -122,6 +192,60 @@ func (c *Config) validate() error {
 // gated on UplinkDevice so a host without a configured uplink keeps the legacy
 // MMDS-only behaviour.
 func (c *Config) natEnabled() bool { return c.UplinkDevice != "" }
+
+// persistEnabled reports whether per-server world disks should be created and
+// overlaid (P5a). Off by default so MMDS-only hosts are unchanged.
+func (c *Config) persistEnabled() bool { return c.WorldPersistence }
+
+// liveSnapshotEnabled reports whether VMs should get a vsock control device and
+// a Quiesce runspec so the host can snapshot them while running (P5c). It needs
+// both a world disk (to freeze) and a store (to snapshot into).
+func (c *Config) liveSnapshotEnabled() bool {
+	return c.persistEnabled() && c.WorldStore != nil
+}
+
+// validatePersistence fills world-disk defaults and checks that mkfs.ext4 is
+// available, so a misconfigured host fails fast at startup rather than at the
+// first Provision. It is only called when persistEnabled.
+func (c *Config) validatePersistence() error {
+	if c.DataDir == "" {
+		c.DataDir = filepath.Join(c.WorkDir, "worlds")
+	}
+	if c.WorldDiskMB <= 0 {
+		c.WorldDiskMB = DefaultWorldDiskMB
+	}
+	if c.MkfsExt4Path == "" {
+		c.MkfsExt4Path = defaultMkfsExt4
+	}
+	if c.RCONPort == 0 {
+		c.RCONPort = DefaultRCONPort
+	}
+	if c.Logger == nil {
+		c.Logger = zap.NewNop()
+	}
+	if err := resolveExecutable(c.MkfsExt4Path); err != nil {
+		return fmt.Errorf("firecracker: world persistence needs mkfs.ext4: %w", err)
+	}
+	if err := os.MkdirAll(c.DataDir, 0o750); err != nil {
+		return fmt.Errorf("firecracker: world data dir: %w", err)
+	}
+	return nil
+}
+
+// resolveExecutable verifies a configured tool is runnable: an explicit path
+// (containing a separator) must exist, a bare name must resolve on PATH.
+func resolveExecutable(name string) error {
+	if strings.ContainsRune(name, os.PathSeparator) {
+		if _, err := os.Stat(name); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := exec.LookPath(name); err != nil {
+		return err
+	}
+	return nil
+}
 
 // validateDataplane fills dataplane defaults and checks the addressing is
 // self-consistent (subnet parses, gateway sits inside it, port range is sane).

@@ -105,6 +105,20 @@ type RunSpec struct {
 	// never owned by a host interface, so nothing would answer an ARP).
 	// Absent when the host runs MMDS-only (no NAT dataplane).
 	Net *NetConfig `json:"net,omitempty"`
+
+	// Persist, when non-nil, tells the guest init to make WorkingDir
+	// durable: the host has attached a writable data disk (the world
+	// disk), and the guest overlays it onto WorkingDir so the read-only
+	// image content shows through while every runtime write lands on the
+	// disk. Absent when the host runs without world persistence (P5).
+	Persist *PersistConfig `json:"persist,omitempty"`
+
+	// Quiesce, when non-nil, enables the in-VM snapshot control server
+	// (P5c): the guest listens on vsock and, on the host's request, flushes
+	// the workload (RCON) and freezes the world disk filesystem so the host
+	// can take an application-consistent snapshot of a *running* server.
+	// Absent when the host can't take live snapshots.
+	Quiesce *QuiesceConfig `json:"quiesce,omitempty"`
 }
 
 // NetConfig is the guest-applied side of the NAT dataplane addressing. All
@@ -125,6 +139,57 @@ type NetConfig struct {
 	// GatewayMAC is the MAC installed as Gateway's permanent neighbor.
 	GatewayMAC string `json:"gateway_mac"`
 }
+
+// PersistConfig is the guest-applied side of world persistence (P5). The
+// host attaches a per-server writable ext4 data disk as Device and the
+// in-VM init (cmd/init) overlays it onto Mountpoint: it mounts Device,
+// then mount -t overlay with lowerdir=Mountpoint (the read-only image
+// dir), upperdir/workdir on the disk, back onto Mountpoint. The result
+// is that the workload sees the image's baked content but every write —
+// the Minecraft world, logs, edited configs — is captured on the disk,
+// which is the unit a backup snapshots.
+type PersistConfig struct {
+	// Device is the guest block device the host attached the world disk
+	// as (e.g. "/dev/vdb").
+	Device string `json:"device"`
+	// Mountpoint is the directory the overlay is mounted at — the
+	// workload's WorkingDir. Must be an absolute, non-root path so the
+	// overlay has a real lowerdir to union over.
+	Mountpoint string `json:"mountpoint"`
+}
+
+// QuiesceConfig is the guest side of application-consistent snapshots (P5c).
+// The guest init runs a control server on VsockControlPort; when the host asks
+// it to PREPARE, it flushes the workload through RCON (if configured) and then
+// fsfreezes the world-disk filesystem, so the host snapshots a quiescent disk;
+// RESUME thaws and re-enables saves. RCON fields are optional — without them
+// the guest freezes only (filesystem-consistent, but in-memory unsaved state is
+// not captured).
+type QuiesceConfig struct {
+	// RCONAddress is the in-VM address of the workload's RCON endpoint
+	// (e.g. "127.0.0.1:25575"). Empty skips the application flush.
+	RCONAddress string `json:"rcon_address,omitempty"`
+	// RCONPassword authenticates to RCON.
+	RCONPassword string `json:"rcon_password,omitempty"`
+}
+
+// VsockControlPort is the guest AF_VSOCK port the snapshot control server
+// listens on, and the port the host connects to through the VM's vsock UDS. It
+// is shared here so host and guest can't drift.
+const VsockControlPort = 1024
+
+// Snapshot control protocol (P5c), spoken line-by-line over the vsock
+// connection. The host sends a command; the guest replies OK or "ERR <msg>".
+const (
+	// SnapPrepare asks the guest to flush + freeze for a snapshot.
+	SnapPrepare = "PREPARE"
+	// SnapResume asks the guest to thaw + re-enable saves.
+	SnapResume = "RESUME"
+	// SnapOK is the guest's success reply.
+	SnapOK = "OK"
+	// SnapErrPrefix prefixes the guest's failure reply ("ERR <message>").
+	SnapErrPrefix = "ERR "
+)
 
 // Argv returns the full command line (Entrypoint followed by Cmd).
 // Returns nil when both are empty — the init agent treats that as
