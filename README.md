@@ -1,14 +1,20 @@
 # craftling-go
 
-A Go HTTP service built with [Gin](https://github.com/gin-gonic/gin).
-
-The control plane for a multi-host, Firecracker-microVM Minecraft hosting
-platform. See [PLAN.md](docs/PLAN.md) for the phased roadmap from here to production.
+The control plane **and** host agent for a multi-host, Firecracker-microVM
+Minecraft hosting platform. A [Gin](https://github.com/gin-gonic/gin) HTTP API
+owns users, auth, and game-server desired state; a reconciler drives each server
+onto a fleet host; and a per-host **agent** boots it as a real Firecracker
+microVM. See [docs/PLAN.md](docs/PLAN.md) for the phased roadmap (P0–P4 landed;
+P6 networking in progress).
 
 ## Requirements
 
 - Go 1.26+
 - PostgreSQL 13+
+- For the real VM backend (`AGENT_RUNTIME=firecracker`): a Linux host with
+  `/dev/kvm`, the `firecracker` binary, a `vmlinux` kernel, and rootfs images.
+- For (re)building the eBPF dataplane: clang + libbpf + bpftool on a Linux ≥6.6
+  host (see [docs/ebpf-nat-dataplane.md](docs/ebpf-nat-dataplane.md)).
 
 ## Getting started
 
@@ -22,10 +28,13 @@ docker run -d --name craftling-pg -e POSTGRES_PASSWORD=postgres \
 make run               # or: go run ./cmd/server
 ```
 
-The server listens on `:8080` by default and applies the schema
-(`internal/db/schema.sql`) automatically on startup.
+The server listens on `:8080` by default and applies the embedded **goose
+migrations** (`internal/db/migrations`) automatically on startup — clean on both
+a fresh database and one already at an older revision.
 
 ## Configuration
+
+### Control plane (`make run`)
 
 | Variable       | Default                                                          | Description                      |
 | -------------- | --------------------------------------------------------------- | -------------------------------- |
@@ -37,6 +46,24 @@ The server listens on `:8080` by default and applies the schema
 | `REFRESH_TTL`  | `720h` (30d)                                                  | Refresh-token lifetime           |
 | `ADMIN_EMAIL`    | _(unset)_                                                    | If set with `ADMIN_PASSWORD`, seeds/promotes this admin on startup |
 | `ADMIN_PASSWORD` | _(unset)_                                                    | Admin bootstrap password         |
+| `TEMPLATE_INDEX_URL` | _(unset)_                                                | Marketplace registry index the `/templates` API fetches from |
+
+### Host agent (`make run-agent`, `MODE=agent`)
+
+| Variable          | Default            | Description                                            |
+| ----------------- | ------------------ | ------------------------------------------------------ |
+| `CONTROL_PLANE_URL` | `http://localhost:8080` | Control plane the agent registers + heartbeats with |
+| `ADVERTISE_ADDR`  | `localhost:9000`   | Agent API address the control plane calls back         |
+| `ADVERTISE_HOST`  | `127.0.0.1`        | Player-facing connect host VMs report                  |
+| `AGENT_RUNTIME`   | `fake`             | VM backend: `fake` (in-memory) or `firecracker` (real microVMs) |
+| `FC_BINARY`       | `firecracker`      | Firecracker executable (PATH lookup by default)        |
+| `FC_KERNEL`       | _(required)_       | Uncompressed `vmlinux` all VMs boot                    |
+| `FC_IMAGE_DIR`    | _(required)_       | Directory of per-version `minecraft-<version>.ext4` rootfs images |
+| `FC_DEFAULT_IMAGE`| _(unset)_          | Fallback rootfs filename when a version has no image   |
+| `FC_WORK_DIR`     | OS temp dir        | Per-VM working dirs (sockets, writable rootfs, logs)   |
+
+`AGENT_ID`, `AGENT_HOSTNAME`, `ZONE`, `CPUS_TOTAL`, `MEMORY_MB_TOTAL`, and
+`AGENT_VERSION` further describe the host in its registration.
 
 ## Endpoints
 
@@ -54,8 +81,13 @@ The server listens on `:8080` by default and applies the schema
 | GET    | `/api/v1/servers/:id`    | Bearer | Get one of your servers             |
 | PATCH  | `/api/v1/servers/:id`    | Bearer | Rename, or set `desired_state` (running/stopped) |
 | DELETE | `/api/v1/servers/:id`    | Bearer | Tear down a server (`202`)          |
+| GET    | `/api/v1/templates`      | Bearer | List marketplace templates          |
+| GET    | `/api/v1/templates/:id`  | Bearer | Get one template's manifest         |
 | GET    | `/api/v1/admin/users`    | Admin  | List all users (role `admin` only)  |
 | GET    | `/api/v1/admin/servers`  | Admin  | List all servers across all owners  |
+| GET    | `/api/v1/admin/hosts`    | Admin  | List the fleet                      |
+| POST   | `/api/v1/agent/hosts/register`      | Agent | Host registers itself        |
+| POST   | `/api/v1/agent/hosts/:id/heartbeat` | Agent | Host liveness + capacity heartbeat |
 
 Auth endpoints return a token pair:
 
@@ -129,10 +161,10 @@ create time.
 backend is `provisioner.RemoteProvisioner`, which resolves the assigned host's
 address and calls that host's **agent** (`cmd/agent` / `internal/agent`) over
 HTTP to provision/start/stop/deprovision the VM. The agent runs a `Runtime`;
-today that's the in-memory `FakeRuntime` (synthetic `vm_id`, `host:25565`), and a
-real Firecracker driver (P4) drops in behind the same interface — the API and
-reconciler are unchanged. Agents register and heartbeat with the control plane
-so the scheduler knows the fleet.
+which one is chosen by `AGENT_RUNTIME` (`fake` for the in-memory stub, or
+`firecracker` for real microVMs) — the API and reconciler are identical either
+way because both satisfy the same `agent.Runtime` interface. Agents register and
+heartbeat with the control plane so the scheduler knows the fleet.
 
 ```bash
 # Create a server (desired_state defaults to running)
@@ -156,35 +188,75 @@ Deletes are **soft**: the reconciler deprovisions the VM and then sets
 `status = deleted` with a `deleted_at` timestamp. The row is retained for
 history/audit but hidden from every API read (and from reconciliation).
 
+## Firecracker runtime, the image pipeline & networking
+
+**Runtime (P4).** `internal/agent/firecracker` boots each server as a real
+Firecracker microVM, driving Firecracker through the in-repo generated REST
+client (`internal/firecracker`) over the per-VM API Unix socket and managing the
+VMM process directly. `Provision` stages a per-VM writable copy of the version's
+base rootfs, launches `firecracker`, configures machine/boot-source/drive, then
+starts the instance; `Stop` sends `SendCtrlAltDel` (force-kill after a grace
+period) **but keeps the rootfs** so the world survives a restart on that host;
+`Start` re-boots from it. `make test-kvm` runs the gated lifecycle integration
+test on a `/dev/kvm` host.
+
+**Image pipeline.** `internal/image` converts an OCI/Docker image into a
+read-only **squashfs** rootfs (`internal/squashfs`), injecting the Go init binary
+(`cmd/init`) as PID 1. The init agent mounts the kernel filesystems, fetches a
+**run spec** (`internal/runspec`) from Firecracker's MMDS over the link-local
+address, applies per-VM networking, then execs and supervises the workload —
+powering the VM off when it exits. The control plane resolves launchable
+templates from a marketplace registry (`internal/registry`, the `/templates`
+API).
+
+**Networking (P6, in progress).** An eBPF NAT dataplane gives each VM real
+connectivity with no Linux bridge and no iptables/nftables rules: TCX-attached
+programs SNAT egress and DNAT a per-server host port to the in-VM service port,
+reusing the kernel's `nf_conntrack` via `bpf_ct_*` kfuncs. The guest applies its
+address, gateway neighbor, and default route from the run spec. Design and
+current status: [docs/ebpf-nat-dataplane.md](docs/ebpf-nat-dataplane.md).
+
 ## Layout
 
 ```
-cmd/server          control-plane entry point, DB connect/migrate + graceful shutdown
-cmd/agent           host-worker entry point: VM API + register/heartbeat (P3)
-internal/config     environment configuration (incl. agent config)
-internal/db         pgx pool + embedded migrations
+cmd/server          control-plane entry point: DB connect/migrate + HTTP API + graceful shutdown
+cmd/agent           host-agent entry point: VM API + register/heartbeat; selects the VM backend
+cmd/init            in-VM PID 1: mount, fetch run spec from MMDS, apply networking, supervise workload
+internal/config     environment configuration (control plane + agent + Firecracker)
+internal/db         pgx pool + embedded goose migrations
 internal/model      domain types (User, GameServer, Host)
 internal/repository data access (Postgres; in-memory host inventory)
 internal/auth       bcrypt password hashing + JWT issue/verify
-internal/handler    control-plane routes and request handlers
+internal/handler    control-plane routes (auth, servers, templates, admin, agent)
 internal/middleware request ID, request logging, JWT/agent auth guards
-internal/scheduler  host placement + capacity reservation (P2)
+internal/registry   template registry (marketplace) client
+internal/scheduler  host placement + atomic capacity reservation (P2)
 internal/reconciler desired-state → observed-status convergence loop
 internal/provisioner Provisioner seam: Fake + RemoteProvisioner (P3)
-internal/agent      host agent: Runtime/FakeRuntime, VM API server, clients (P3)
+internal/agent      host agent: Runtime interface, FakeRuntime, VM API server + clients (P3)
+internal/agent/firecracker  real Firecracker microVM Runtime + eBPF NAT dataplane (P4/P6)
+internal/firecracker generated Firecracker REST client (go-openapi, over the API Unix socket)
+internal/image      OCI/Docker image → squashfs rootfs converter (injects cmd/init)
+internal/squashfs   squashfs writer/compressor used by the converter
+internal/runspec    host↔guest run-spec contract delivered via MMDS
+internal/reaper     periodic background cleanup (stale hosts → down)
+internal/seed       initial-data bootstrap (admin account)
+internal/logger     zap logger + request-scoped context helpers
 ```
 
 ## Commands
 
 ```bash
-make run         # run the control plane
-make run-agent   # run a host agent (MODE=agent; see Makefile for env)
-make build       # build control plane to ./bin/server
-make build-agent # build agent to ./bin/agent
-make test        # run unit tests
-make test-e2e    # run end-to-end tests (requires Docker)
-make tidy        # tidy go.mod
-make fmt         # format code
+make run          # run the control plane
+make run-agent    # run a host agent (MODE=agent; see Makefile/.env.example for env)
+make build        # build control plane to ./bin/server
+make build-agent  # build agent to ./bin/agent
+make test         # run unit tests
+make test-e2e     # run end-to-end tests (requires Docker)
+make test-kvm     # Firecracker lifecycle test (requires /dev/kvm + host artifacts)
+make bpf-generate # regenerate eBPF bindings/objects (Linux ≥6.6 + clang/libbpf/bpftool)
+make tidy         # tidy go.mod
+make fmt          # format code
 ```
 
 ## Testing
@@ -193,8 +265,15 @@ End-to-end tests live in `test/e2e/`. They are gated behind the `e2e` build
 tag, so `make test` (plain `go test ./...`) never touches Docker. The e2e
 suite uses [testcontainers](https://golang.testcontainers.org/) to start a
 real Postgres, serves the actual router over HTTP, and drives the full
-register → login → protected-route flow:
+lifecycle (register → login → server placement → reconcile → teardown):
 
 ```bash
 make test-e2e          # or: go test -tags e2e ./test/e2e/...
+```
+
+The Firecracker lifecycle test is gated behind the `kvm` build tag and kept out
+of the default lane; run it on a KVM host with the `FC_*` artifacts in place:
+
+```bash
+FC_KERNEL=... FC_IMAGE_DIR=... FC_DEFAULT_IMAGE=base.ext4 make test-kvm
 ```
