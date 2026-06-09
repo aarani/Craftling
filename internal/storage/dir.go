@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DirStore is a WorldStore backed by a directory on the host filesystem. It is
@@ -93,4 +94,28 @@ func (s *DirStore) Delete(_ context.Context, serverID string) error {
 		return fmt.Errorf("storage: delete world %q: %w", serverID, err)
 	}
 	return nil
+}
+
+// List returns the stored snapshot keys (file stems without the suffix). A
+// missing root dir yields no keys, not an error — nothing has been stored yet.
+func (s *DirStore) List(_ context.Context) ([]string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("storage: list worlds: %w", err)
+	}
+	var keys []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, WorldSuffix) {
+			continue // skip stray files (e.g. in-flight .tmp uploads)
+		}
+		keys = append(keys, strings.TrimSuffix(name, WorldSuffix))
+	}
+	return keys, nil
 }

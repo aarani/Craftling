@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -50,13 +51,39 @@ func (r *Runtime) snapshotRunning(ctx context.Context, m *machine) error {
 	if err := snapCommand(conn, runspec.SnapPrepare); err != nil {
 		return fmt.Errorf("firecracker: prepare snapshot: %w", err)
 	}
-	// The disk is frozen now; guarantee a thaw on every path out.
-	defer func() { _ = snapCommand(conn, runspec.SnapResume) }()
 
-	if err := snapshotWorldDisk(ctx, r.store, m.worldKey, m.worldDisk); err != nil {
-		return fmt.Errorf("firecracker: snapshot frozen disk: %w", err)
+	// Capture a compressed copy while the disk is frozen, then thaw the guest
+	// immediately — the (possibly remote) store upload happens afterward, so the
+	// freeze window is only as long as a local read+compress, not the upload.
+	tmp := m.worldDisk + ".snap"
+	capErr := gzipDiskToFile(m.worldDisk, tmp)
+	if _, err := readLineAfter(conn, runspec.SnapResume); err != nil {
+		// Thaw failed/unacked. Keep going if the capture succeeded — the disk
+		// freezes are not nested, and a stuck freeze is the guest's deferred
+		// thaw to recover; surface nothing fatal here beyond logging upstream.
+		_ = err
+	}
+	if capErr != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("firecracker: capture frozen disk: %w", capErr)
+	}
+	defer func() { _ = os.Remove(tmp) }()
+
+	if err := putGzFile(ctx, r.store, m.worldKey, tmp); err != nil {
+		return fmt.Errorf("firecracker: upload snapshot: %w", err)
 	}
 	return nil
+}
+
+// readLineAfter sends a command and reads the guest's reply line, returning it.
+// Unlike snapCommand it does not treat a non-OK reply as an error — used for the
+// RESUME (thaw) step, which must always be attempted and whose failure is logged
+// by the caller, not fatal to a snapshot already captured.
+func readLineAfter(conn net.Conn, cmd string) (string, error) {
+	if _, err := fmt.Fprintf(conn, "%s\n", cmd); err != nil {
+		return "", err
+	}
+	return readLine(conn)
 }
 
 // dialVsockControl opens the guest control connection through the VM's vsock

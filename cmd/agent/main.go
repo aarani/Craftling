@@ -20,8 +20,7 @@ import (
 	"github.com/aarani/craftling-go/internal/agent/firecracker"
 	"github.com/aarani/craftling-go/internal/config"
 	applogger "github.com/aarani/craftling-go/internal/logger"
-	"github.com/aarani/craftling-go/internal/storage"
-	s3store "github.com/aarani/craftling-go/internal/storage/s3"
+	"github.com/aarani/craftling-go/internal/worldstore"
 	"go.uber.org/zap"
 )
 
@@ -105,7 +104,9 @@ func newRuntime(cfg *config.Config, log *zap.Logger) (agent.Runtime, error) {
 		log.Info("using firecracker runtime",
 			zap.String("kernel", cfg.Agent.Firecracker.KernelPath),
 			zap.String("image_dir", cfg.Agent.Firecracker.ImageDir))
-		worldStore, err := newWorldStore(cfg, log)
+		storeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		worldStore, err := worldstore.FromConfig(storeCtx, cfg.Agent.Firecracker, log)
+		cancel()
 		if err != nil {
 			return nil, err
 		}
@@ -132,43 +133,6 @@ func newRuntime(cfg *config.Config, log *zap.Logger) (agent.Runtime, error) {
 	default:
 		return nil, fmt.Errorf("unknown agent runtime %q", cfg.Agent.Runtime)
 	}
-}
-
-// newWorldStore selects the durable world store from config (P5b): an
-// S3-compatible bucket when an endpoint is set, otherwise a local/NFS directory,
-// otherwise none (worlds stay host-local). S3 takes precedence over a dir.
-func newWorldStore(cfg *config.Config, log *zap.Logger) (storage.WorldStore, error) {
-	fc := cfg.Agent.Firecracker
-	if fc.WorldStoreS3.Endpoint != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		s, err := s3store.New(ctx, s3store.Config{
-			Endpoint:        fc.WorldStoreS3.Endpoint,
-			Bucket:          fc.WorldStoreS3.Bucket,
-			Region:          fc.WorldStoreS3.Region,
-			AccessKeyID:     fc.WorldStoreS3.AccessKeyID,
-			SecretAccessKey: fc.WorldStoreS3.SecretAccessKey,
-			UseSSL:          fc.WorldStoreS3.UseSSL,
-			Prefix:          fc.WorldStoreS3.Prefix,
-		})
-		if err != nil {
-			return nil, err
-		}
-		log.Info("world store enabled",
-			zap.String("backend", "s3"),
-			zap.String("endpoint", fc.WorldStoreS3.Endpoint),
-			zap.String("bucket", fc.WorldStoreS3.Bucket))
-		return s, nil
-	}
-	if dir := fc.WorldStoreDir; dir != "" {
-		s, err := storage.NewDirStore(dir)
-		if err != nil {
-			return nil, err
-		}
-		log.Info("world store enabled", zap.String("backend", "dir"), zap.String("dir", dir))
-		return s, nil
-	}
-	return nil, nil
 }
 
 // runRegistration registers the host then heartbeats on an interval until ctx is

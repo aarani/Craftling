@@ -64,15 +64,46 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) {
 
 // reconcile advances a single server one step toward its desired state.
 func (r *Reconciler) reconcile(ctx context.Context, s *model.GameServer) error {
-	switch s.DesiredState {
-	case model.DesiredDeleted:
+	// A pending delete supersedes everything else (deprovision destroys the
+	// world anyway, so a queued backup is moot).
+	if s.DesiredState == model.DesiredDeleted {
 		return r.delete(ctx, s)
+	}
+	// Honor an on-demand backup request out of band from the desired-state
+	// convergence. Its failures are self-contained (logged, retried), never
+	// flipping the running server to an error status.
+	if s.BackupRequested {
+		r.backup(ctx, s)
+	}
+	switch s.DesiredState {
 	case model.DesiredStopped:
 		return r.stop(ctx, s)
 	case model.DesiredRunning:
 		return r.start(ctx, s)
 	default:
 		return nil
+	}
+}
+
+// backup performs a pending on-demand world snapshot. A running server is
+// snapshotted live via the agent; a stopped server already had its world
+// snapshotted on stop, so the request is satisfied immediately. Either way the
+// flag is cleared. A live-snapshot failure leaves the flag set so the next tick
+// retries, without disturbing the server's status.
+func (r *Reconciler) backup(ctx context.Context, s *model.GameServer) {
+	if s.Status != model.StatusRunning || s.VMID == nil || *s.VMID == "" {
+		if err := r.servers.MarkBackedUp(ctx, s.ID); err != nil {
+			r.log.Error("clear backup request", zap.String("id", s.ID), zap.Error(err))
+		}
+		return
+	}
+	if err := r.prov.Snapshot(ctx, s); err != nil {
+		r.log.Warn("on-demand backup failed; will retry", zap.String("id", s.ID), zap.Error(err))
+		return // leave backup_requested set for the next tick
+	}
+	r.log.Info("server backed up", zap.String("id", s.ID))
+	if err := r.servers.MarkBackedUp(ctx, s.ID); err != nil {
+		r.log.Error("clear backup request", zap.String("id", s.ID), zap.Error(err))
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/aarani/craftling-go/internal/repository"
 	"github.com/aarani/craftling-go/internal/scheduler"
 	"github.com/aarani/craftling-go/internal/seed"
+	"github.com/aarani/craftling-go/internal/worldstore"
 	"go.uber.org/zap"
 )
 
@@ -35,6 +36,9 @@ const (
 	hostHeartbeatTTL = 30 * time.Second
 	// agentCallTimeout bounds each control-plane→agent VM API call.
 	agentCallTimeout = 10 * time.Second
+	// worldGCInterval is how often the durable world store is swept for
+	// snapshots belonging to no live server (P5b).
+	worldGCInterval = time.Hour
 )
 
 func main() {
@@ -102,6 +106,18 @@ func main() {
 	prov := provisioner.NewRemote(hostRepo, agent.NewClient(&http.Client{Timeout: agentCallTimeout}))
 	rec := reconciler.New(repository.NewGameServerRepository(pool), prov, sched, zlog)
 	go rec.Run(ctx, reconcileInterval)
+
+	// If a durable world store is configured, periodically GC snapshots that no
+	// live server claims (orphans from a host that died before its server was
+	// deprovisioned). The control plane sees the same store the agents do.
+	storeCtx, storeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	worldStore, err := worldstore.FromConfig(storeCtx, cfg.Agent.Firecracker, zlog)
+	storeCancel()
+	if err != nil {
+		zlog.Warn("world store unavailable; world GC disabled", zap.Error(err))
+	} else if worldStore != nil {
+		go reaper.Worlds(ctx, zlog, worldStore, repository.NewGameServerRepository(pool), worldGCInterval)
+	}
 
 	// Start the server in a goroutine so it doesn't block graceful shutdown handling.
 	go func() {

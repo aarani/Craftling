@@ -45,6 +45,40 @@ func TestWorldSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
+// TestGzipDiskToFileRoundTrip checks the live-snapshot codec: gzip a disk to a
+// temp file, upload it, and restore it back to identical bytes. This is the
+// freeze-window path (capture local, upload after thaw).
+func TestGzipDiskToFileRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.NewDirStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "world.ext4")
+	content := append([]byte("HDR-9f3a"), make([]byte, 1<<15)...) // header + zero run
+	if err := os.WriteFile(src, content, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	gz := filepath.Join(dir, "world.snap")
+	if err := gzipDiskToFile(src, gz); err != nil {
+		t.Fatalf("gzipDiskToFile: %v", err)
+	}
+	if err := putGzFile(ctx, store, "srv-1", gz); err != nil {
+		t.Fatalf("putGzFile: %v", err)
+	}
+
+	dst := filepath.Join(dir, "restored.ext4")
+	if err := restoreWorldDisk(ctx, store, "srv-1", dst); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, _ := os.ReadFile(dst)
+	if !bytes.Equal(got, content) {
+		t.Errorf("round trip differs (got %d bytes, want %d)", len(got), len(content))
+	}
+}
+
 // TestPrepareWorldDiskRestoresFromStore checks Provision's disk-prep step pulls
 // an existing world from the store instead of formatting a fresh one. The mkfs
 // path is bogus on purpose: if the restore branch didn't short-circuit, the

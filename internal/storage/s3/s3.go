@@ -149,6 +149,24 @@ func (s *S3Store) Delete(ctx context.Context, serverID string) error {
 	return nil
 }
 
+// List returns the stored snapshot keys (object names with the prefix and
+// suffix stripped). Objects that don't fit the "<prefix>…<suffix>" shape are
+// skipped, so an unrelated object sharing the bucket is never reported.
+func (s *S3Store) List(ctx context.Context) ([]string, error) {
+	var keys []string
+	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: s.prefix}) {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("storage/s3: list worlds: %w", obj.Err)
+		}
+		name := strings.TrimPrefix(obj.Key, s.prefix)
+		if !strings.HasSuffix(name, storage.WorldSuffix) {
+			continue
+		}
+		keys = append(keys, strings.TrimSuffix(name, storage.WorldSuffix))
+	}
+	return keys, nil
+}
+
 // isNotFound reports whether an error from minio-go means the object (or bucket)
 // is absent. minio-go surfaces these as a typed ErrorResponse with an S3 code or
 // a 404 status.

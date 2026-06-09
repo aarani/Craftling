@@ -103,6 +103,34 @@ func TestRemoteProvisionerStartProvisions(t *testing.T) {
 	}
 }
 
+// TestRemoteProvisionerSnapshot verifies a snapshot of a provisioned server is
+// forwarded to its host's agent, and that a server with no VM is a no-op (no
+// dial).
+func TestRemoteProvisionerSnapshot(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(agent.NewRouter(agent.NewFakeRuntime("10.0.0.22"), zap.NewNop()))
+	defer srv.Close()
+
+	p := NewRemote(stubResolver{addr: srv.URL}, agent.NewClient(nil))
+	s := &model.GameServer{ID: "srv-3", HostID: ptr("host-3"), Version: "1.20.4", CPUs: 1, MemoryMB: 1024}
+
+	inst, err := p.Provision(ctx, s)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	s.VMID = &inst.VMID
+	if err := p.Snapshot(ctx, s); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// No VM: nothing to snapshot, and we must not dial anyone (the resolver
+	// points at an unroutable address, so a dial would error).
+	dead := NewRemote(stubResolver{addr: "http://127.0.0.1:1"}, agent.NewClient(nil))
+	if err := dead.Snapshot(ctx, &model.GameServer{ID: "x", HostID: ptr("h")}); err != nil {
+		t.Errorf("snapshot with no vm = %v, want nil", err)
+	}
+}
+
 func assertRemoteState(t *testing.T, p *RemoteProvisioner, s *model.GameServer, want State) {
 	t.Helper()
 	got, err := p.Status(context.Background(), s)
