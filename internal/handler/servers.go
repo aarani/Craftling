@@ -163,6 +163,22 @@ func (h *ServerHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"status": "deleting"})
 }
 
+// RequestBackup flags an owned server for an on-demand world snapshot. It only
+// records intent; the reconciler (the sole writer of compute side effects) takes
+// the snapshot via the agent on its next tick.
+func (h *ServerHandler) RequestBackup(c *gin.Context) {
+	s, ok := h.ownedOr404(c)
+	if !ok {
+		return
+	}
+	if err := h.servers.RequestBackup(c.Request.Context(), s.ID); err != nil {
+		logger.FromContext(c).Error("request backup", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"status": "backup requested"})
+}
+
 // ownedOr404 loads the server in the URL and verifies the caller owns it.
 // It writes a 404 for both missing and non-owned servers (no existence leak).
 func (h *ServerHandler) ownedOr404(c *gin.Context) (*model.GameServer, bool) {

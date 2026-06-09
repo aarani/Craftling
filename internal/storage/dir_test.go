@@ -118,3 +118,42 @@ func TestDirStorePutNoPartialOnError(t *testing.T) {
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("boom") }
+
+// TestDirStoreList checks List returns the SafeKey'd keys of stored worlds and
+// skips strays, and that a key it returns round-trips back through the store.
+func TestDirStoreList(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s, err := NewDirStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if keys, err := s.List(ctx); err != nil || len(keys) != 0 {
+		t.Fatalf("List on empty = %v, %v; want [], nil", keys, err)
+	}
+
+	for _, id := range []string{"a", "b", "tenant/c"} { // last one is sanitized
+		if err := s.Put(ctx, id, strings.NewReader("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A stray non-".world" file must be ignored.
+	if err := os.WriteFile(filepath.Join(root, "README.txt"), []byte("hi"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 3 {
+		t.Fatalf("List returned %d keys, want 3: %v", len(keys), keys)
+	}
+	// A returned key round-trips: Delete(key) removes it (SafeKey is idempotent).
+	for _, k := range keys {
+		if ok, _ := s.Exists(ctx, k); !ok {
+			t.Errorf("listed key %q does not Exists", k)
+		}
+	}
+}

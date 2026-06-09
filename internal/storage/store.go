@@ -56,6 +56,12 @@ type WorldStore interface {
 	// Delete removes the snapshot for serverID. A missing snapshot is not an
 	// error — delete is idempotent teardown.
 	Delete(ctx context.Context, serverID string) error
+
+	// List returns the keys of all stored snapshots. Each key is a SafeKey'd
+	// server id (SafeKey is idempotent, so a returned key round-trips back
+	// through the other methods unchanged). The world GC reaper uses it to find
+	// snapshots no live server claims.
+	List(ctx context.Context) ([]string, error)
 }
 
 // SafeKey maps a server id to a single safe object/path token, replacing

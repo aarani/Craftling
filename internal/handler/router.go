@@ -66,6 +66,7 @@ func NewRouter(cfg *config.Config, log *zap.Logger, pool *pgxpool.Pool, hostRepo
 			servers.GET("", serverHandler.List)
 			servers.GET("/:id", serverHandler.Get)
 			servers.PATCH("/:id", serverHandler.Update)
+			servers.POST("/:id/snapshot", serverHandler.RequestBackup)
 			servers.DELETE("/:id", serverHandler.Delete)
 		}
 

@@ -98,6 +98,52 @@ func waitForGone(t *testing.T, token, id string) {
 	t.Fatalf("server %s was not deleted within timeout", id)
 }
 
+// TestServerBackupRequest exercises the on-demand backup flow (P5): the API
+// records intent, and the reconciler — the sole writer of compute side effects —
+// snapshots via the agent and clears the flag. With the in-process FakeRuntime
+// agent the snapshot is a no-op, so the observable effect is backup_requested
+// flipping back to false with last_backup_at stamped.
+func TestServerBackupRequest(t *testing.T) {
+	user := registerUser(t, "backup-user@example.com", "hunter2pass")
+	tok := user.AccessToken
+
+	id := createServerID(t, tok, "backup-world")
+	running := waitForStatus(t, tok, id, "running")
+	if running["backup_requested"] != false {
+		t.Fatalf("new running server backup_requested = %v, want false", running["backup_requested"])
+	}
+
+	resp, body := doJSON(t, http.MethodPost, "/api/v1/servers/"+id+"/snapshot", tok, nil)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("request backup status = %d, body = %s", resp.StatusCode, body)
+	}
+
+	// The reconciler should perform the backup and clear the flag shortly.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, b := get(t, "/api/v1/servers/"+id, tok)
+		s := decodeServer(t, b)
+		if s["backup_requested"] == false && s["last_backup_at"] != nil {
+			return // success: flag cleared and timestamp stamped
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("server %s backup request was not honored within timeout", id)
+}
+
+// TestServerBackupRequiresOwnership verifies a backup request on someone else's
+// server is a 404 (no existence leak), like the other owner-scoped routes.
+func TestServerBackupRequiresOwnership(t *testing.T) {
+	owner := registerUser(t, "backup-owner@example.com", "hunter2pass")
+	other := registerUser(t, "backup-other@example.com", "hunter2pass")
+	id := createServerID(t, owner.AccessToken, "owned-world")
+
+	resp, _ := doJSON(t, http.MethodPost, "/api/v1/servers/"+id+"/snapshot", other.AccessToken, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-owner backup status = %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestGameServerLifecycle exercises create -> reconcile-to-running -> stop ->
 // start -> delete through the real HTTP API and reconciler.
 func TestGameServerLifecycle(t *testing.T) {

@@ -52,6 +52,51 @@ func snapshotWorldDisk(ctx context.Context, store storage.WorldStore, serverID, 
 	return nil
 }
 
+// gzipDiskToFile compresses the world disk at diskPath into a new gz file at
+// gzPath. It is the freeze-window half of a live snapshot: callers run it while
+// the guest has the disk frozen, then thaw and upload the small gz file
+// separately — so the freeze lasts only as long as a local read+compress, not a
+// (possibly remote) store upload.
+func gzipDiskToFile(diskPath, gzPath string) error {
+	in, err := os.Open(diskPath) //nolint:gosec // driver-controlled path
+	if err != nil {
+		return fmt.Errorf("open world disk: %w", err)
+	}
+	defer func() { _ = in.Close() }()
+
+	out, err := os.OpenFile(gzPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640) //nolint:gosec // driver-controlled path
+	if err != nil {
+		return fmt.Errorf("create snapshot temp: %w", err)
+	}
+	gz := gzip.NewWriter(out)
+	if _, err := io.Copy(gz, in); err != nil {
+		_ = gz.Close()
+		_ = out.Close()
+		return fmt.Errorf("compress world disk: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("flush snapshot temp: %w", err)
+	}
+	return out.Close()
+}
+
+// putGzFile uploads an already-gzipped snapshot file (produced by
+// gzipDiskToFile) to the store under serverID. The store keeps opaque bytes, so
+// restoreWorldDisk's gunzip reads it back the same way it reads a streamed
+// snapshot.
+func putGzFile(ctx context.Context, store storage.WorldStore, serverID, gzPath string) error {
+	f, err := os.Open(gzPath) //nolint:gosec // driver-controlled path
+	if err != nil {
+		return fmt.Errorf("open snapshot temp: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := store.Put(ctx, serverID, f); err != nil {
+		return fmt.Errorf("store world snapshot: %w", err)
+	}
+	return nil
+}
+
 // restoreWorldDisk downloads serverID's snapshot, decompresses it, and writes it
 // to diskPath, replacing whatever is there. It builds a sibling temp file and
 // renames into place so an interrupted restore never leaves a half-written disk

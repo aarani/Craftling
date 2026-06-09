@@ -21,7 +21,8 @@ func NewGameServerRepository(pool *pgxpool.Pool) *GameServerRepository {
 }
 
 const gameServerColumns = `id, owner_id, name, game, version, cpus, memory_mb,
-	desired_state, status, host_id, vm_id, host, port, status_message, created_at, updated_at`
+	desired_state, status, host_id, vm_id, host, port, status_message,
+	backup_requested, last_backup_at, created_at, updated_at`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface {
@@ -33,7 +34,7 @@ func scanGameServer(row scannable) (*model.GameServer, error) {
 	err := row.Scan(
 		&s.ID, &s.OwnerID, &s.Name, &s.Game, &s.Version, &s.CPUs, &s.MemoryMB,
 		&s.DesiredState, &s.Status, &s.HostID, &s.VMID, &s.Host, &s.Port, &s.StatusMessage,
-		&s.CreatedAt, &s.UpdatedAt,
+		&s.BackupRequested, &s.LastBackupAt, &s.CreatedAt, &s.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -87,11 +88,31 @@ func (r *GameServerRepository) ListReconcilable(ctx context.Context) ([]model.Ga
 		SELECT ` + gameServerColumns + ` FROM game_servers
 		WHERE deleted_at IS NULL
 		  AND (desired_state = 'deleted'
+		   OR backup_requested
 		   OR (desired_state = 'running' AND status <> 'running')
 		   OR (desired_state = 'stopped' AND status <> 'stopped'))
 		ORDER BY updated_at
 		LIMIT 100`
 	return r.query(ctx, q)
+}
+
+// ListActiveIDs returns the ids of every live (non-deleted) server. The world
+// GC reaper uses it to find stored worlds that no live server claims.
+func (r *GameServerRepository) ListActiveIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT id FROM game_servers WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (r *GameServerRepository) query(ctx context.Context, q string, args ...any) ([]model.GameServer, error) {
@@ -182,6 +203,24 @@ func (r *GameServerRepository) MarkStopped(ctx context.Context, id string) error
 		SET status = 'stopped', vm_id = NULL, host = NULL, port = NULL,
 		    status_message = NULL, updated_at = now()
 		WHERE id = $1`,
+		id)
+	return err
+}
+
+// RequestBackup flags a server for an on-demand world snapshot. The reconciler
+// picks it up and performs the snapshot (the API never touches compute).
+func (r *GameServerRepository) RequestBackup(ctx context.Context, id string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE game_servers SET backup_requested = true, updated_at = now() WHERE id = $1`,
+		id)
+	return err
+}
+
+// MarkBackedUp clears the backup request and stamps the time, once the
+// reconciler has taken (or determined it need not take) the snapshot.
+func (r *GameServerRepository) MarkBackedUp(ctx context.Context, id string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE game_servers SET backup_requested = false, last_backup_at = now(), updated_at = now() WHERE id = $1`,
 		id)
 	return err
 }

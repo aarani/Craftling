@@ -111,6 +111,19 @@ func (p *RemoteProvisioner) Status(ctx context.Context, s *model.GameServer) (St
 	return stateOf(vm), nil
 }
 
+// Snapshot asks the assigned host's agent to take a live world snapshot. A
+// server with no backing VM has nothing running to snapshot, so it is a no-op.
+func (p *RemoteProvisioner) Snapshot(ctx context.Context, s *model.GameServer) error {
+	if s.VMID == nil || *s.VMID == "" {
+		return nil
+	}
+	base, err := p.baseURL(ctx, s)
+	if err != nil {
+		return err
+	}
+	return p.client.Snapshot(ctx, base, *s.VMID)
+}
+
 // baseURL resolves the agent base URL for the server's assigned host.
 func (p *RemoteProvisioner) baseURL(ctx context.Context, s *model.GameServer) (string, error) {
 	if s.HostID == nil || *s.HostID == "" {

@@ -54,6 +54,12 @@ type GameServer struct {
 	Port          *int    `json:"port,omitempty"`
 	StatusMessage *string `json:"status_message,omitempty"`
 
+	// BackupRequested is a user-set flag asking for an on-demand world snapshot
+	// (P5). The reconciler — the sole writer of compute side effects — performs
+	// the snapshot via the agent, then clears the flag and stamps LastBackupAt.
+	BackupRequested bool       `json:"backup_requested"`
+	LastBackupAt    *time.Time `json:"last_backup_at,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
