@@ -84,6 +84,48 @@ type FirecrackerConfig struct {
 	DefaultImage string
 	// WorkDir is where per-VM working dirs live (empty: OS temp dir).
 	WorkDir string
+
+	// WorldPersistence enables the per-server world disk + guest overlay
+	// (P5a). Requires mkfs.ext4 on the host and a guest kernel with
+	// CONFIG_OVERLAY_FS + CONFIG_EXT4_FS.
+	WorldPersistence bool
+	// DataDir is where per-server world disks live (empty: "worlds" under
+	// WorkDir). Only used when WorldPersistence is set.
+	DataDir string
+	// WorldDiskMB is the size of a freshly created world disk (0: driver default).
+	WorldDiskMB int
+	// MkfsExt4Path is the mkfs.ext4 executable (empty: look up on PATH).
+	MkfsExt4Path string
+	// WorldStoreDir, when set, points at a directory (e.g. an NFS mount)
+	// used as the durable world store (P5b): worlds are restored from and
+	// snapshotted into it, so they survive a server delete or host
+	// reschedule. Empty keeps worlds local-only. Ignored when an S3 endpoint
+	// is configured (S3 takes precedence).
+	WorldStoreDir string
+	// WorldStoreS3 configures an S3-compatible durable world store (P5b),
+	// taking precedence over WorldStoreDir when Endpoint is set.
+	WorldStoreS3 S3StoreConfig
+	// SnapshotInterval, when > 0, turns on periodic application-consistent
+	// snapshots of running servers (P5c). Needs a world store.
+	SnapshotInterval time.Duration
+	// RCONPort / RCONPassword let the guest flush the workload via RCON
+	// before freezing its disk for a live snapshot. Empty password = freeze
+	// only (filesystem-consistent).
+	RCONPort     int
+	RCONPassword string
+}
+
+// S3StoreConfig configures an S3-compatible world store. It is a plain mirror of
+// storage/s3.Config so internal/config (and the control-plane binary) need not
+// import the S3 SDK; cmd/agent maps it across.
+type S3StoreConfig struct {
+	Endpoint        string
+	Bucket          string
+	Region          string
+	AccessKeyID     string
+	SecretAccessKey string
+	UseSSL          bool
+	Prefix          string
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -106,11 +148,28 @@ func Load() *Config {
 			ControlPlaneURL: getEnv("CONTROL_PLANE_URL", "http://localhost:8080"),
 			Runtime:         getEnv("AGENT_RUNTIME", RuntimeFake),
 			Firecracker: FirecrackerConfig{
-				BinaryPath:   getEnv("FC_BINARY", ""),
-				KernelPath:   getEnv("FC_KERNEL", ""),
-				ImageDir:     getEnv("FC_IMAGE_DIR", ""),
-				DefaultImage: getEnv("FC_DEFAULT_IMAGE", ""),
-				WorkDir:      getEnv("FC_WORK_DIR", ""),
+				BinaryPath:       getEnv("FC_BINARY", ""),
+				KernelPath:       getEnv("FC_KERNEL", ""),
+				ImageDir:         getEnv("FC_IMAGE_DIR", ""),
+				DefaultImage:     getEnv("FC_DEFAULT_IMAGE", ""),
+				WorkDir:          getEnv("FC_WORK_DIR", ""),
+				WorldPersistence: getBoolEnv("FC_WORLD_PERSIST", false),
+				DataDir:          getEnv("FC_DATA_DIR", ""),
+				WorldDiskMB:      getIntEnv("FC_WORLD_DISK_MB", 0),
+				MkfsExt4Path:     getEnv("FC_MKFS_EXT4", ""),
+				WorldStoreDir:    getEnv("FC_WORLD_STORE_DIR", ""),
+				WorldStoreS3: S3StoreConfig{
+					Endpoint:        getEnv("FC_WORLD_STORE_S3_ENDPOINT", ""),
+					Bucket:          getEnv("FC_WORLD_STORE_S3_BUCKET", ""),
+					Region:          getEnv("FC_WORLD_STORE_S3_REGION", ""),
+					AccessKeyID:     getEnv("FC_WORLD_STORE_S3_ACCESS_KEY", ""),
+					SecretAccessKey: getEnv("FC_WORLD_STORE_S3_SECRET_KEY", ""),
+					UseSSL:          getBoolEnv("FC_WORLD_STORE_S3_USE_SSL", false),
+					Prefix:          getEnv("FC_WORLD_STORE_S3_PREFIX", ""),
+				},
+				SnapshotInterval: getDurationEnv("FC_SNAPSHOT_INTERVAL", 0),
+				RCONPort:         getIntEnv("FC_RCON_PORT", 0),
+				RCONPassword:     getEnv("FC_RCON_PASSWORD", ""),
 			},
 			ID:            getEnv("AGENT_ID", ""),
 			Hostname:      getEnv("AGENT_HOSTNAME", defaultHostname()),
@@ -143,6 +202,15 @@ func getIntEnv(key string, fallback int) int {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func getBoolEnv(key string, fallback bool) bool {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return fallback

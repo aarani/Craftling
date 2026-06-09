@@ -95,6 +95,25 @@ func run(logger *zap.Logger) {
 			zap.String("gateway", spec.Net.Gateway))
 	}
 
+	// Make WorkingDir durable before launching the workload, so the world it
+	// writes lands on the persistent disk instead of tmpfs. Absent on hosts
+	// without world persistence (P5).
+	if spec.Persist != nil {
+		if err := applyPersist(spec.Persist); err != nil {
+			logger.Fatal("init: set up world persistence", zap.Error(err))
+		}
+		logger.Info("init: world persistence enabled",
+			zap.String("device", spec.Persist.Device),
+			zap.String("mountpoint", spec.Persist.Mountpoint))
+	}
+
+	// Start the snapshot control server so the host can take consistent live
+	// snapshots. Requires the world disk to be mounted (Persist), since it
+	// freezes that filesystem. Best-effort and non-blocking.
+	if spec.Quiesce != nil && spec.Persist != nil {
+		startSnapshotControl(logger, spec.Quiesce)
+	}
+
 	argv := spec.Argv()
 	if len(argv) == 0 {
 		logger.Fatal("init: run spec has no entrypoint or cmd")

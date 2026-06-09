@@ -112,6 +112,28 @@ func TestAgentServerClientRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAgentSnapshotRoundTrip exercises the on-demand snapshot endpoint over the
+// real HTTP seam: a known VM succeeds (the fake runtime no-ops), an unknown one
+// surfaces a not-found error to the caller.
+func TestAgentSnapshotRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(NewRouter(NewFakeRuntime("10.0.0.9"), zap.NewNop()))
+	defer srv.Close()
+	client := NewClient(nil)
+	base := srv.URL
+
+	vm, err := client.Provision(ctx, base, VMSpec{ServerID: "s3", CPUs: 1, MemoryMB: 1024})
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if err := client.Snapshot(ctx, base, vm.ID); err != nil {
+		t.Fatalf("snapshot known vm: %v", err)
+	}
+	if err := client.Snapshot(ctx, base, "vm-ghost"); err == nil {
+		t.Error("snapshot unknown vm: expected error, got nil")
+	}
+}
+
 func assertState(t *testing.T, rt Runtime, vmID, want string) {
 	t.Helper()
 	vm, err := rt.Status(context.Background(), vmID)

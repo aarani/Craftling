@@ -51,6 +51,12 @@ func (c *Client) Stop(ctx context.Context, baseURL, vmID string) error {
 	return err
 }
 
+// Snapshot asks the agent to take an on-demand world snapshot of a running VM.
+func (c *Client) Snapshot(ctx context.Context, baseURL, vmID string) error {
+	_, err := c.doVM(ctx, http.MethodPost, baseURL+"/vms/"+vmID+"/snapshot", nil)
+	return err
+}
+
 // Deprovision asks the agent to destroy a VM.
 func (c *Client) Deprovision(ctx context.Context, baseURL, vmID string) error {
 	_, err := c.doVM(ctx, http.MethodDelete, baseURL+"/vms/"+vmID, nil)

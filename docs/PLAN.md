@@ -90,15 +90,39 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 - **New code:** ✅ `internal/agent/firecracker`; per-version rootfs catalog; `config.FirecrackerConfig` + runtime selector; `cmd/agent` backend wiring. (Image-build scripts deferred.)
 - **Verify:** ✅ KVM-gated lifecycle integration test behind the `kvm` build tag (`make test-kvm`) on a `/dev/kvm` host, kept out of the default CI lane; non-KVM unit tests cover validation, image resolution, and idempotency edges. Manual: connect a Minecraft client.
 
-## P5 — World persistence (object/network storage)
+## P5 — World persistence (data disk → object/network storage)
 
 - **Goal:** durable world data; precondition for safe rescheduling between hosts.
+- **Why the shape:** on the squashfs+init image path (`internal/image`, `cmd/init`) the rootfs is mounted **read-only** and everything writable is **tmpfs (guest RAM)** — so a Minecraft world written under the workload's `WorkingDir` is **lost on stop**. (Only the legacy ext4 image path persisted, because the whole rootfs was a writable per-VM copy.) Durable persistence therefore requires a writable device that is *separate from the immutable image* and *separate from the ephemeral per-VM working dir*. We add that device, then layer backup/restore and cross-host migration on top. The build is split into three increments so each lands verifiable on its own.
+
+### P5a — Per-server world data disk (writable device + guest overlay) ✅ landing now
+- **Decision:** keep the read-only squashfs rootfs; attach a **second virtio-blk device** (`/dev/vdb`) backed by a per-server ext4 **world disk**, and have the in-VM init **overlay** it onto the workload's `WorkingDir`. `lowerdir` = the image's `WorkingDir` (read-only); `upperdir`/`workdir` = the world disk. The server jar and baked config show through from the image; every runtime write (world, logs, `server.properties` edits) lands on the world disk — which is exactly the unit a backup snapshots. This is the "overlay" option from the design discussion; the "rsync over vsock" alternative is folded into P5c as a *control* channel rather than a data pipe.
 - **Steps:**
-  - `internal/storage`: `WorldStore` interface (`Put`/`Get`/`Exists`) with an S3-compatible impl (and/or NFS mount); per-server world key.
-  - Agent: pull world archive into the VM data disk before launch; on stop / periodically, RCON `save-all` + flush, archive, upload.
-  - Reschedule: because the world lives in the store, deprovision on host A → provision on host B is safe.
-- **New code:** `internal/storage` (`WorldStore`, S3 impl); snapshot logic in agent.
-- **Verify:** stop on host A, force-start on host B, world intact; e2e with a MinIO testcontainer.
+  - Host (`internal/agent/firecracker`): on `Provision` of a runspec VM with persistence enabled, create+format a per-server world disk under a `DataDir` keyed by `server_id` (decoupled from the per-VM `WorkDir` that `Deprovision` wipes), `mkfs.ext4` it once, and attach it as a non-root drive in `machine.configure`. The disk survives stop/start (same path re-attached on `Start`); `Deprovision` removes it (P5b snapshots first).
+  - Contract (`internal/runspec`): add `Persist {Device, Mountpoint}` to `RunSpec`, published via MMDS like `Net`.
+  - Guest (`cmd/init`): when `Persist` is set, mount `Device` (ext4) on a `/run` tmpfs scratch dir (the rootfs is read-only), then `mount -t overlay` with `lowerdir=WorkingDir` onto `WorkingDir`.
+  - Config gate (`FC_WORLD_PERSIST`, `FC_DATA_DIR`, `FC_WORLD_DISK_MB`): off by default so MMDS-only hosts are unaffected. Requires `mkfs.ext4` on the host and `CONFIG_OVERLAY_FS` + `CONFIG_EXT4_FS` in the guest kernel.
+- **New code:** `firecracker` world-disk create/attach + config; `runspec.PersistConfig`; `cmd/init/persist_linux.go`.
+- **Verify:** non-KVM unit tests (world-disk path/sanitization, reuse-existing idempotency, config defaults/validation); KVM integration test — write a token under `WorkingDir` on first boot, `Stop`, `Start`, assert the token survived (proves it landed on the data disk, not tmpfs).
+
+### P5b — World store: snapshot, restore, reschedule ✅ (DirStore; S3 follow-up)
+- **Decision:** the store moves opaque bytes keyed by `server_id`; the agent owns the disk↔stream codec (gzip of the raw ext4 image — a mostly-zeroed disk compresses to almost nothing, so snapshots are cheap without the store knowing about filesystems). Lifecycle is anchored to how the reconciler actually calls the driver: **Provision restores** from the store (else formats fresh), **Stop snapshots** into it (the guest has powered off and synced, so the image is consistent), **Deprovision deletes** the blob (deprovision = server delete). The reschedule path is therefore *Stop on host A → Provision on host B*, both store-mediated — not Deprovision, which destroys.
+- **Done:**
+  - `internal/storage`: `WorldStore` interface (`Exists`/`Put`/`Get`/`Delete`, `ErrWorldNotFound`) + `DirStore`, a filesystem/NFS-mount backend (stdlib only, atomic temp+rename, key-sanitized). Point several agents at one shared mount and they see the same worlds — enough for cross-host reschedule without object storage.
+  - `firecracker`: gzip snapshot/restore codec (`worldsnapshot.go`); `Config.WorldStore`; restore-on-Provision (`prepareWorldDisk`), snapshot-on-Stop, delete-on-Deprovision; wired through `internal/config` (`FC_WORLD_STORE_DIR`) + `cmd/agent`.
+  - Verified: storage round-trip / containment / no-partial-on-error unit tests; codec round-trip + restore-vs-fresh prep tests; KVM e2e `TestKVMWorldStoreReschedule` — two runtimes sharing one store, world moves A→B only through the store.
+- **S3 backend ✅:** `internal/storage/s3` — an S3-compatible `WorldStore` over minio-go (works against AWS S3, MinIO, Ceph, …), kept in its own package so the SDK stays out of the lightweight `internal/storage` import the driver pulls in. Static keys or the AWS credential chain (IAM role); `New` verifies the bucket at startup; objects keyed `<prefix><SafeKey>.world` (the keying helper is now shared with `DirStore`). Selected in `cmd/agent` via `FC_WORLD_STORE_S3_*` (S3 takes precedence over `FC_WORLD_STORE_DIR`). Verified by a MinIO-testcontainer e2e (`-tags e2e`) covering round-trip, replace, not-found→`ErrWorldNotFound`, idempotent delete, and missing-bucket startup failure — run green against a live MinIO.
+- **Follow-up:** periodic snapshots already land via P5c's sweep; remaining is a world GC policy for truly-deleted servers, and async upload off the freeze window (snapshot to a local temp while frozen, then upload) which matters most now that the store can be remote S3.
+
+### P5c — Consistent snapshots (vsock quiesce control channel) ✅ (mechanism + periodic; on-demand at agent boundary)
+- **Why:** a Minecraft server writes region files continuously; a snapshot taken mid-write is torn. The agent quiesces the game (RCON `save-off` + `save-all flush`) and `fsfreeze`s the world-disk filesystem, snapshots, then resumes — with an **ack** the read-only MMDS path can't carry, so it rides a vsock control channel.
+- **Done:**
+  - Contract (`internal/runspec`): `QuiesceConfig{RCONAddress, RCONPassword}` + `VsockControlPort` + the line protocol constants (`PREPARE`/`RESUME`/`OK`/`ERR`).
+  - Guest (`cmd/init`): an AF_VSOCK control server (`vsock_linux.go`) — on `PREPARE` it RCON-flushes (a minimal stdlib Source-RCON client, `rcon.go`) then `FIFREEZE`s the world-disk fs; on `RESUME` it `FITHAW`s + `save-on`. The freeze is held across the connection, so a dropped host always thaws (deferred).
+  - Host (`firecracker`): `PutGuestVsock` per VM; `quiesce.go` drives the Firecracker UDS `CONNECT` handshake + `PREPARE → snapshot → RESUME` (thaw deferred so a snapshot failure never wedges the disk frozen); a **periodic sweep** (`SnapshotInterval`, `FC_SNAPSHOT_INTERVAL`) snapshots every running VM, bounding crash-loss to one interval. Knobs `FC_RCON_PORT`/`FC_RCON_PASSWORD`.
+  - **On-demand** at the agent boundary: `agent.Runtime.Snapshot` + `POST /vms/:id/snapshot` + `agent.Client.Snapshot` (the autonomous periodic path covers the other half of "both").
+  - Verified: RCON codec + fake-server unit tests; host vsock orchestration against a fake guest (PREPARE precedes RESUME; thaw runs even on snapshot failure); agent snapshot HTTP round-trip; KVM e2e `TestKVMLiveSnapshot` — live-snapshot a *running* VM (freeze-only; busybox has no RCON) and restore it on a second runtime.
+- **Follow-up:** the **user-facing control-plane trigger** (`POST /api/v1/servers/:id/snapshot`) is intentionally deferred — it needs an invariant-respecting design, since the reconciler is the *sole writer of compute side effects* and a direct handler→provisioner call would be a second writer. Likely a desired-action/`backup_requested` flag the reconciler enacts (extends `Provisioner` with `Snapshot`). Also: async upload off the freeze window (snapshot to a local temp while frozen, thaw, then upload — matters once the store is S3, not the local DirStore).
 
 ## P6 — Networking / player access
 
@@ -160,7 +184,7 @@ Auth + refresh rotation + roles; `game_servers` CRUD + admin fleet-view; reconci
 | P2 | — | `internal/scheduler` | `game_servers.host_id` |
 | P3 | `cmd/agent` | `internal/agent`, `provisioner.RemoteProvisioner` | — |
 | P4 | — | `internal/agent/firecracker` (image build deferred) | — |
-| P5 | — | `internal/storage` | — |
+| P5 | — | world disk + overlay (`firecracker`, `runspec.Persist`, `cmd/init`); `internal/storage` (`WorldStore`, `DirStore`); vsock quiesce | per-server world disk (host file) + world snapshot (store blob) |
 | P6 | — | agent networking | `ports` (or host range) |
 | P7 | — | metrics, health probes | `server_health` / cols |
 | P8 | — | backoff, reschedule, leader election | `game_servers.attempts/next_attempt_at` |

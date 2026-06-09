@@ -39,6 +39,19 @@ type machine struct {
 	runSpec *runspec.RunSpec
 	tapName string
 
+	// worldDisk, when non-empty, is the host path of this VM's per-server
+	// world disk (P5a). It is attached as a second, non-root virtio-blk
+	// device (/dev/vdb) and survives stop/start; the guest overlays it onto
+	// the workload's WorkingDir. Empty when world persistence is disabled.
+	worldDisk string
+	// worldKey is the server-scoped key the world disk and its durable
+	// snapshot (P5b) are stored under. Empty when persistence is disabled.
+	worldKey string
+	// vsockUDS, when non-empty, is the host Unix-socket path Firecracker
+	// exposes this VM's vsock on. The host connects to it to reach the guest
+	// snapshot control server (P5c). Empty when live snapshots are disabled.
+	vsockUDS string
+
 	// dp, net, and servicePort are set only when the NAT dataplane is enabled
 	// and this VM has a runSpec. dp is the shared eBPF collection; net is this
 	// VM's allocated addressing; servicePort is the in-VM service port the
@@ -123,6 +136,36 @@ func (m *machine) configure(ctx context.Context) error {
 			PathOnHost:   m.rootfs,
 		})); err != nil {
 		return fmt.Errorf("root drive: %w", err)
+	}
+
+	// Attach the per-server world disk as a second, non-root drive. It
+	// surfaces in the guest as /dev/vdb (the root squashfs is /dev/vda);
+	// the in-VM init overlays it onto WorkingDir from the runspec Persist
+	// block. No-op when world persistence is disabled.
+	if m.worldDisk != "" {
+		wid := worldDriveID
+		notRoot := false
+		if _, err := m.api.PutGuestDriveByID(fcclient.NewPutGuestDriveByIDParamsWithContext(ctx).
+			WithDriveID(wid).
+			WithBody(&fcmodels.Drive{
+				DriveID:      &wid,
+				IsRootDevice: &notRoot,
+				IsReadOnly:   false,
+				PathOnHost:   m.worldDisk,
+			})); err != nil {
+			return fmt.Errorf("world drive: %w", err)
+		}
+	}
+
+	// Attach a vsock device so the host can drive the guest snapshot control
+	// server (P5c). No-op when live snapshots are disabled for this VM.
+	if m.vsockUDS != "" {
+		cid := int64(guestCID)
+		uds := m.vsockUDS
+		if _, err := m.api.PutGuestVsock(fcclient.NewPutGuestVsockParamsWithContext(ctx).
+			WithBody(&fcmodels.Vsock{GuestCid: &cid, UdsPath: &uds})); err != nil {
+			return fmt.Errorf("vsock: %w", err)
+		}
 	}
 
 	// Publish the run spec via MMDS for the in-VM init agent. No-op when

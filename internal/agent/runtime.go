@@ -77,6 +77,10 @@ type Runtime interface {
 	// Status reports a VM's observed state, returning StateMissing for an
 	// unknown id rather than an error.
 	Status(ctx context.Context, vmID string) (*VM, error)
+	// Snapshot takes an application-consistent snapshot of a running VM's
+	// world into the durable store (P5c), on demand. ErrVMNotFound for an
+	// unknown id; an error if the runtime has no world store configured.
+	Snapshot(ctx context.Context, vmID string) error
 }
 
 // FakeRuntime is an in-memory Runtime that simulates VMs. It lets the control
@@ -157,6 +161,18 @@ func (r *FakeRuntime) Status(_ context.Context, vmID string) (*VM, error) {
 		return clone(vm), nil
 	}
 	return &VM{ID: vmID, State: StateMissing}, nil
+}
+
+// Snapshot is a no-op for the fake runtime — it has no real world disk to
+// capture. It reports ErrVMNotFound for an unknown id so callers can still tell
+// a known VM from a missing one.
+func (r *FakeRuntime) Snapshot(_ context.Context, vmID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.vms[vmID]; !ok {
+		return ErrVMNotFound
+	}
+	return nil
 }
 
 func clone(vm *VM) *VM {

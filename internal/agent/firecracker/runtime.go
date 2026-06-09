@@ -7,10 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/aarani/craftling-go/internal/agent"
 	"github.com/aarani/craftling-go/internal/runspec"
+	"github.com/aarani/craftling-go/internal/storage"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // Runtime is the agent.Runtime backed by real Firecracker microVMs. It owns the
@@ -24,6 +27,16 @@ type Runtime struct {
 	// ipam hands out per-VM addresses and host ports.
 	dp   *natDataplane
 	ipam *ipam
+
+	// store is the durable world store (P5b), non-nil when WorldPersistence is
+	// on and a store is configured. Provision restores from it, Stop snapshots
+	// into it, Deprovision deletes from it.
+	store storage.WorldStore
+
+	// done is closed by Close to stop the periodic snapshot sweep (P5c); sweepWG
+	// tracks the sweeper goroutine so Close can wait for it to exit.
+	done    chan struct{}
+	sweepWG sync.WaitGroup
 
 	mu  sync.Mutex
 	vms map[string]*machine
@@ -42,7 +55,14 @@ func New(cfg Config) (*Runtime, error) {
 		return nil, fmt.Errorf("firecracker: work dir: %w", err)
 	}
 
-	r := &Runtime{cfg: cfg, vms: make(map[string]*machine)}
+	r := &Runtime{cfg: cfg, vms: make(map[string]*machine), done: make(chan struct{})}
+	if cfg.persistEnabled() {
+		r.store = cfg.WorldStore
+	}
+	if r.store != nil && cfg.SnapshotInterval > 0 {
+		r.sweepWG.Add(1)
+		go r.snapshotSweep(cfg.SnapshotInterval)
+	}
 
 	// Bring up the shared eBPF NAT dataplane once, here, when an uplink is
 	// configured. A failure is fatal: a half-networked host would boot VMs that
@@ -66,12 +86,58 @@ func New(cfg Config) (*Runtime, error) {
 	return r, nil
 }
 
-// Close tears down the NAT dataplane (detaching all eBPF programs). It is safe
-// to call when the dataplane was never enabled.
+// Close stops the periodic snapshot sweep and tears down the NAT dataplane
+// (detaching all eBPF programs). It is safe to call when neither was enabled.
 func (r *Runtime) Close() {
+	close(r.done)
+	r.sweepWG.Wait()
 	if r.dp != nil {
 		r.dp.Close()
 	}
+}
+
+// snapshotSweep periodically takes an application-consistent snapshot of every
+// running VM, bounding crash data-loss to one interval. It runs each VM's
+// snapshot serially (each freezes that VM's disk only briefly); failures are
+// logged, never fatal — a missed interval is recoverable, a crashed sweeper is
+// not.
+func (r *Runtime) snapshotSweep(interval time.Duration) {
+	defer r.sweepWG.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.done:
+			return
+		case <-ticker.C:
+			for _, m := range r.snapshotCandidates() {
+				ctx, cancel := context.WithTimeout(context.Background(), snapshotDeadline)
+				if err := r.snapshotRunning(ctx, m); err != nil {
+					r.cfg.Logger.Warn("periodic world snapshot failed",
+						zap.String("vm", m.id), zap.String("server", m.serverID), zap.Error(err))
+				} else {
+					r.cfg.Logger.Debug("periodic world snapshot taken",
+						zap.String("vm", m.id), zap.String("server", m.serverID))
+				}
+				cancel()
+			}
+		}
+	}
+}
+
+// snapshotCandidates returns a snapshot of the running, live-snapshot-capable
+// machines, taken under the lock so the sweep can then snapshot each without
+// holding it (a freeze + disk read is slow and must not block the VM API).
+func (r *Runtime) snapshotCandidates() []*machine {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*machine
+	for _, m := range r.vms {
+		if m.vsockUDS != "" && m.worldDisk != "" && m.running() {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // Provision creates a per-VM working dir + writable rootfs and boots a microVM.
@@ -98,29 +164,76 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 		return nil, fmt.Errorf("firecracker: stage rootfs: %w", err)
 	}
 
+	// Both the NAT dataplane and world persistence augment the runspec the
+	// guest init fetches, and both only apply on the MMDS/runspec path —
+	// legacy ext4 VMs (no runspec) have their own init and stay MMDS-only.
+	// Copy the caller's runspec once so we never mutate a shared struct.
 	runSpec := spec.RunSpec
 	var vmnet vmNet
-	// The NAT dataplane needs the in-VM init agent to apply per-VM addressing,
-	// which only exists on the MMDS/runspec path. Legacy ext4 VMs (no runspec)
-	// stay MMDS-only even when the dataplane is enabled for other VMs.
-	if r.dp != nil && runSpec != nil {
-		n, err := r.ipam.allocate()
-		if err != nil {
-			_ = os.RemoveAll(dir)
-			return nil, err
-		}
-		vmnet = n
-		// Copy the caller's runspec and attach the guest network config so we
-		// never mutate a shared/caller-owned struct.
+	var worldDisk, worldKey string
+	if runSpec != nil && (r.dp != nil || r.cfg.persistEnabled()) {
 		rs := *runSpec
-		rs.Net = &runspec.NetConfig{
-			Interface:  runspec.MMDSInterface,
-			Address:    vmnet.VMIP.String(),
-			PrefixLen:  vmnet.PrefixLen,
-			Gateway:    vmnet.GatewayIP.String(),
-			GatewayMAC: vmnet.GatewayMAC.String(),
+
+		if r.dp != nil {
+			n, err := r.ipam.allocate()
+			if err != nil {
+				_ = os.RemoveAll(dir)
+				return nil, err
+			}
+			vmnet = n
+			rs.Net = &runspec.NetConfig{
+				Interface:  runspec.MMDSInterface,
+				Address:    vmnet.VMIP.String(),
+				PrefixLen:  vmnet.PrefixLen,
+				Gateway:    vmnet.GatewayIP.String(),
+				GatewayMAC: vmnet.GatewayMAC.String(),
+			}
 		}
+
+		if r.cfg.persistEnabled() {
+			target, ok := persistTarget(rs.WorkingDir)
+			if !ok {
+				r.releaseNet(vmnet)
+				_ = os.RemoveAll(dir)
+				return nil, fmt.Errorf("firecracker: world persistence requires an absolute, non-root WorkingDir, got %q", rs.WorkingDir)
+			}
+			// Key the disk by server id so it can outlive this VM instance and
+			// a host reschedule (the world store is keyed the same way); fall
+			// back to the VM id when a spec carries no server id.
+			worldKey = spec.ServerID
+			if worldKey == "" {
+				worldKey = id
+			}
+			wd := r.cfg.worldDiskPath(worldKey)
+			if err := r.prepareWorldDisk(ctx, worldKey, wd); err != nil {
+				r.releaseNet(vmnet)
+				_ = os.RemoveAll(dir)
+				return nil, fmt.Errorf("firecracker: world disk: %w", err)
+			}
+			worldDisk = wd
+			rs.Persist = &runspec.PersistConfig{Device: worldDevice, Mountpoint: target}
+
+			// When a store is configured, enable live snapshots: the guest
+			// gets a Quiesce block (flush + freeze) and we attach a vsock
+			// device below so the host can drive it.
+			if r.cfg.liveSnapshotEnabled() {
+				q := &runspec.QuiesceConfig{}
+				if r.cfg.RCONPassword != "" {
+					q.RCONAddress = fmt.Sprintf("127.0.0.1:%d", r.cfg.RCONPort)
+					q.RCONPassword = r.cfg.RCONPassword
+				}
+				rs.Quiesce = q
+			}
+		}
+
 		runSpec = &rs
+	}
+
+	// The host-side vsock UDS lives in the per-VM dir; set it when this VM has
+	// a Quiesce block so configure() attaches the device.
+	var vsockUDS string
+	if runSpec != nil && runSpec.Quiesce != nil {
+		vsockUDS = filepath.Join(dir, "vsock.sock")
 	}
 
 	m := &machine{
@@ -136,6 +249,9 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 		memoryMB:    spec.MemoryMB,
 		runSpec:     runSpec,
 		tapName:     tapNameFor(id),
+		worldDisk:   worldDisk,
+		worldKey:    worldKey,
+		vsockUDS:    vsockUDS,
 		dp:          r.dp,
 		net:         vmnet,
 		servicePort: defaultMinecraftPort,
@@ -180,6 +296,16 @@ func (r *Runtime) Stop(ctx context.Context, vmID string) error {
 		return nil
 	}
 	m.shutdown(ctx)
+	// The guest has powered off (synced) by the time shutdown returns, so the
+	// disk image is consistent — snapshot it to the durable store now, so a
+	// later delete or reschedule can restore the world. A snapshot failure is
+	// returned, not swallowed: the stop succeeded but the world wasn't saved,
+	// and the reconciler should retry rather than silently risk data loss.
+	if r.store != nil && m.worldDisk != "" {
+		if err := snapshotWorldDisk(ctx, r.store, m.worldKey, m.worldDisk); err != nil {
+			return fmt.Errorf("firecracker: snapshot world on stop: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -206,6 +332,21 @@ func (r *Runtime) Deprovision(_ context.Context, vmID string) error {
 		}
 		_ = deleteTAP(m.tapName)
 	}
+	// Destroy the world disk along with the VM. This is the point P5b will
+	// snapshot-then-upload before removing, so a deprovision becomes a safe
+	// teardown rather than data loss; for now destroy means destroy. Removing
+	// the keyed parent dir (DataDir/<key>) takes the disk with it.
+	if m.worldDisk != "" {
+		if err := os.RemoveAll(filepath.Dir(m.worldDisk)); err != nil {
+			return fmt.Errorf("firecracker: remove world disk: %w", err)
+		}
+		// Delete the durable copy too: deprovision is a server delete, so the
+		// world is meant to be gone. Best-effort — an orphaned blob is harmless
+		// (a later GC can sweep it) and must not block teardown.
+		if r.store != nil {
+			_ = r.store.Delete(context.Background(), m.worldKey)
+		}
+	}
 	if err := os.RemoveAll(m.dir); err != nil {
 		return fmt.Errorf("firecracker: remove vm dir: %w", err)
 	}
@@ -222,6 +363,40 @@ func (r *Runtime) Status(_ context.Context, vmID string) (*agent.VM, error) {
 		return &agent.VM{ID: vmID, State: agent.StateMissing}, nil
 	}
 	return r.vmView(m), nil
+}
+
+// prepareWorldDisk readies a server's world disk at diskPath before boot. When
+// a world store holds a snapshot for this server it restores that (the
+// reschedule / re-create path); otherwise it formats a fresh empty disk. A
+// restored image already carries an ext4, so no mkfs is needed.
+func (r *Runtime) prepareWorldDisk(ctx context.Context, serverID, diskPath string) error {
+	if r.store != nil {
+		ok, err := r.store.Exists(ctx, serverID)
+		if err != nil {
+			return fmt.Errorf("check world store: %w", err)
+		}
+		if ok {
+			return restoreWorldDisk(ctx, r.store, serverID, diskPath)
+		}
+	}
+	return ensureWorldDisk(diskPath, r.cfg.WorldDiskMB, r.cfg.MkfsExt4Path)
+}
+
+// Snapshot takes an on-demand application-consistent snapshot of a running VM's
+// world (P5c). It is the same freeze→store→thaw exchange the periodic sweep
+// uses. ErrVMNotFound for an unknown id; an error when live snapshots aren't
+// configured for this VM (no store / no vsock).
+func (r *Runtime) Snapshot(ctx context.Context, vmID string) error {
+	r.mu.Lock()
+	m, ok := r.vms[vmID]
+	r.mu.Unlock()
+	if !ok {
+		return agent.ErrVMNotFound
+	}
+	if r.store == nil || m.vsockUDS == "" || m.worldDisk == "" {
+		return fmt.Errorf("firecracker: live snapshot not available for vm %s", vmID)
+	}
+	return r.snapshotRunning(ctx, m)
 }
 
 // releaseNet returns a VM's address/port to the IPAM pool. No-op when the
