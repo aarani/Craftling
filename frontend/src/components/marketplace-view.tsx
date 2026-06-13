@@ -1,13 +1,13 @@
 /* marketplace-view.tsx — registry gallery. Lists templates from the control
- * plane, and on selection opens the dynamic config form. Stops at resolving the
- * env (the seam for the future init/rootfs + create-server step). */
+ * plane, and on selection opens the dynamic config form. On launch it resolves
+ * the template's env and creates the game server from the manifest's image. */
 import { useCallback, useEffect, useState } from "react"
 import { Icon } from "./icon"
 import { Btn } from "./primitives"
 import { TemplateDrawer, type TemplateLaunch } from "./template-drawer"
 import { api, ApiError, type TemplateSummary } from "@/lib/api"
 
-export function MarketplaceView() {
+export function MarketplaceView({ onLaunched }: { onLaunched?: () => void } = {}) {
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -33,12 +33,25 @@ export function MarketplaceView() {
     load()
   }, [load])
 
-  // Stops here per scope: surface the resolved env; provisioning comes later.
-  const onComplete = useCallback((launch: TemplateLaunch) => {
-    console.log("[marketplace] resolved launch", launch)
-    setSelected(null)
-    setLaunched(launch)
-  }, [])
+  // Create the server from the template's image. The control plane pins the
+  // image to a digest and the reconciler provisions it. Errors propagate to the
+  // drawer so it stays open and shows the failure; on success we close it and
+  // jump to the Servers view to watch provisioning.
+  const onComplete = useCallback(
+    async (launch: TemplateLaunch) => {
+      const { manifest } = launch
+      await api.createServer({
+        name: launch.name,
+        version: manifest.image_tag,
+        image: `${manifest.image_name}:${manifest.image_tag}`,
+        env: launch.env,
+      })
+      setSelected(null)
+      setLaunched(launch)
+      onLaunched?.()
+    },
+    [onLaunched]
+  )
 
   return (
     <div className="page-inner">
@@ -87,8 +100,8 @@ export function MarketplaceView() {
         >
           <Icon name="check" size={15} style={{ flex: "none" }} />
           <span>
-            <b>{launched.name}</b> configured from <b>{launched.manifest.template_name}</b> —{" "}
-            {Object.keys(launched.env).length} env vars resolved. Provisioning hand-off is next.
+            <b>{launched.name}</b> launched from <b>{launched.manifest.template_name}</b> — now
+            provisioning. Track it in the Servers view.
           </span>
           <button
             className="icon-btn sm"

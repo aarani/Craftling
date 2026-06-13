@@ -1,6 +1,6 @@
 /* template-drawer.tsx — fetches a template manifest, renders its variables as a
- * dynamic form, enforces EULA acceptance, and live-resolves the env. The
- * resolved env is the hand-off point for the future provisioning step. */
+ * dynamic form, enforces EULA acceptance, and live-resolves the env. Submitting
+ * hands the resolved launch to the parent, which creates the server. */
 import { useEffect, useMemo, useState } from "react"
 import { Icon } from "./icon"
 import { Btn } from "./primitives"
@@ -26,7 +26,7 @@ export function TemplateDrawer({
 }: {
   summary: TemplateSummary
   onClose: () => void
-  onComplete: (launch: TemplateLaunch) => void
+  onComplete: (launch: TemplateLaunch) => Promise<void> | void
 }) {
   const [manifest, setManifest] = useState<TemplateManifest | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -34,6 +34,8 @@ export function TemplateDrawer({
   const [name, setName] = useState("")
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [eula, setEula] = useState(false)
+  const [launching, setLaunching] = useState(false)
+  const [launchError, setLaunchError] = useState<string | null>(null)
 
   // Fetch the manifest and seed each variable with its first acceptable answer.
   useEffect(() => {
@@ -64,16 +66,24 @@ export function TemplateDrawer({
 
   const nameValid = name.trim().length >= 3
   const eulaOk = !manifest?.eula_needed || eula
-  const valid = !!manifest && nameValid && eulaOk
+  const valid = !!manifest && nameValid && eulaOk && !launching
 
-  const submit = () => {
+  const submit = async () => {
     if (!valid || !manifest) return
-    onComplete({
-      name: name.trim().toLowerCase().replace(/\s+/g, "-"),
-      manifest,
-      answers,
-      env: resolved,
-    })
+    setLaunching(true)
+    setLaunchError(null)
+    try {
+      await onComplete({
+        name: name.trim().toLowerCase().replace(/\s+/g, "-"),
+        manifest,
+        answers,
+        env: resolved,
+      })
+      // On success the parent unmounts this drawer; nothing more to do.
+    } catch (e) {
+      setLaunchError(e instanceof ApiError ? e.message : "Couldn't launch this server.")
+      setLaunching(false)
+    }
   }
 
   return (
@@ -263,13 +273,38 @@ export function TemplateDrawer({
           )}
         </div>
 
-        <div className="drawer-foot">
-          <Btn variant="ghost" onClick={onClose}>
-            Cancel
-          </Btn>
-          <Btn variant="primary" onClick={submit} disabled={!valid}>
-            <Icon name="bolt" size={15} /> Configure & launch
-          </Btn>
+        <div className="drawer-foot" style={{ flexDirection: "column", alignItems: "stretch", gap: 10 }}>
+          {launchError && (
+            <div
+              className="row gap-2 t-sm"
+              style={{
+                color: "var(--danger-fg)",
+                background: "color-mix(in oklab, var(--danger) 10%, transparent)",
+                padding: "10px 12px",
+                borderRadius: "var(--radius)",
+                alignItems: "center",
+              }}
+            >
+              <Icon name="alert" size={15} style={{ flex: "none" }} />
+              <span>{launchError}</span>
+            </div>
+          )}
+          <div className="row gap-2" style={{ justifyContent: "flex-end" }}>
+            <Btn variant="ghost" onClick={onClose} disabled={launching}>
+              Cancel
+            </Btn>
+            <Btn variant="primary" onClick={submit} disabled={!valid}>
+              {launching ? (
+                <>
+                  <Icon name="restart" className="spin" size={15} /> Launching…
+                </>
+              ) : (
+                <>
+                  <Icon name="bolt" size={15} /> Configure & launch
+                </>
+              )}
+            </Btn>
+          </div>
         </div>
       </div>
     </>

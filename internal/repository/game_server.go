@@ -21,7 +21,7 @@ func NewGameServerRepository(pool *pgxpool.Pool) *GameServerRepository {
 }
 
 const gameServerColumns = `id, owner_id, name, game, version, cpus, memory_mb,
-	image, image_digest, desired_state, status, host_id, vm_id, host, port,
+	image, image_digest, env, desired_state, status, host_id, vm_id, host, port,
 	status_message, backup_requested, last_backup_at, created_at, updated_at`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
@@ -33,7 +33,7 @@ func scanGameServer(row scannable) (*model.GameServer, error) {
 	var s model.GameServer
 	err := row.Scan(
 		&s.ID, &s.OwnerID, &s.Name, &s.Game, &s.Version, &s.CPUs, &s.MemoryMB,
-		&s.Image, &s.ImageDigest, &s.DesiredState, &s.Status, &s.HostID, &s.VMID,
+		&s.Image, &s.ImageDigest, &s.Env, &s.DesiredState, &s.Status, &s.HostID, &s.VMID,
 		&s.Host, &s.Port, &s.StatusMessage,
 		&s.BackupRequested, &s.LastBackupAt, &s.CreatedAt, &s.UpdatedAt,
 	)
@@ -48,12 +48,18 @@ func (r *GameServerRepository) Create(ctx context.Context, s *model.GameServer) 
 	s.ID = uuid.NewString()
 	const q = `
 		INSERT INTO game_servers
-			(id, owner_id, name, game, version, cpus, memory_mb, image, image_digest, desired_state, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			(id, owner_id, name, game, version, cpus, memory_mb, image, image_digest, env, desired_state, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING created_at, updated_at`
+	// Coalesce nil to a non-nil empty slice so pgx encodes it as the empty
+	// array the NOT NULL column expects, never SQL NULL.
+	env := s.Env
+	if env == nil {
+		env = []string{}
+	}
 	return r.pool.QueryRow(ctx, q,
 		s.ID, s.OwnerID, s.Name, s.Game, s.Version, s.CPUs, s.MemoryMB,
-		s.Image, s.ImageDigest, s.DesiredState, s.Status,
+		s.Image, s.ImageDigest, env, s.DesiredState, s.Status,
 	).Scan(&s.CreatedAt, &s.UpdatedAt)
 }
 

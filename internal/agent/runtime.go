@@ -52,6 +52,13 @@ type VMSpec struct {
 	// cache. Empty lets the driver resolve the digest from Image.
 	ImageDigest string `json:"image_digest,omitempty"`
 
+	// Env is the per-server environment as "KEY=VALUE" entries (e.g. a
+	// marketplace template's resolved answers). The Firecracker driver
+	// merges these over the image's own OCI env — these win on conflict —
+	// and publishes the result in the VM's MMDS runspec, so the guest init
+	// execs the workload with them. Ignored on the legacy ext4 path.
+	Env []string `json:"env,omitempty"`
+
 	// RunSpec is the OCI-derived command/env/workdir the guest init
 	// agent should exec, distilled by internal/image at image-pull time.
 	// When set, the Firecracker driver publishes it into the VM's MMDS at

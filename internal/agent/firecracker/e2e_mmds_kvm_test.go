@@ -77,7 +77,10 @@ func TestKVMMMDSEnvRoundTrip(t *testing.T) {
 	}
 
 	// A per-run token we hand the VM only through MMDS. Seeing it echoed
-	// on the console proves init fetched the env from MMDS.
+	// on the console proves init fetched the env from MMDS. We seed the
+	// runspec (the image's OCI env) with a sentinel value and override it
+	// via VMSpec.Env (the per-server env): the real token reaching the
+	// console proves the agent merged per-server env over the image env.
 	token := randomToken(t)
 	const marker = "CRAFTLING_E2E_MARKER"
 	spec := &runspec.RunSpec{
@@ -86,7 +89,7 @@ func TestKVMMMDSEnvRoundTrip(t *testing.T) {
 		// make init power the VM off before we read the log).
 		Cmd: []string{"/bin/sh", "-c",
 			fmt.Sprintf("echo %s:$E2E_TOKEN; exec sleep 600", marker)},
-		Env:        []string{"E2E_TOKEN=" + token},
+		Env:        []string{"E2E_TOKEN=image-default"},
 		WorkingDir: "/",
 	}
 
@@ -99,6 +102,8 @@ func TestKVMMMDSEnvRoundTrip(t *testing.T) {
 		CPUs:     1,
 		MemoryMB: 256,
 		RunSpec:  spec,
+		// Per-server env: overrides the runspec's E2E_TOKEN above.
+		Env: []string{"E2E_TOKEN=" + token},
 	})
 	if err != nil {
 		t.Fatalf("provision: %v", err)

@@ -202,8 +202,15 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 	// once more before mutating so we never write through a shared pointer.
 	var vmnet vmNet
 	var worldDisk, worldKey string
-	if runSpec != nil && (r.dp != nil || r.cfg.persistEnabled()) {
+	if runSpec != nil && (len(spec.Env) > 0 || r.dp != nil || r.cfg.persistEnabled()) {
 		rs := *runSpec
+
+		// Overlay the per-server env onto the image's OCI env (server wins on
+		// conflict), so the same shared squashfs boots with this server's
+		// template-resolved configuration without baking it into the rootfs.
+		if len(spec.Env) > 0 {
+			rs.Env = runspec.MergeEnv(rs.Env, spec.Env)
+		}
 
 		if r.dp != nil {
 			n, err := r.ipam.allocate()

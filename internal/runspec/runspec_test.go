@@ -30,6 +30,56 @@ func TestArgv(t *testing.T) {
 	}
 }
 
+func TestMergeEnv(t *testing.T) {
+	cases := []struct {
+		name      string
+		base      []string
+		overrides []string
+		want      []string
+	}{
+		{"nil both", nil, nil, []string{}},
+		{"base only", []string{"A=1", "B=2"}, nil, []string{"A=1", "B=2"}},
+		{"overrides only", nil, []string{"A=1"}, []string{"A=1"}},
+		{
+			"override wins, keeps base position",
+			[]string{"A=1", "B=2", "C=3"},
+			[]string{"B=override"},
+			[]string{"A=1", "B=override", "C=3"},
+		},
+		{
+			"new keys appended in override order",
+			[]string{"A=1"},
+			[]string{"Z=26", "B=2"},
+			[]string{"A=1", "Z=26", "B=2"},
+		},
+		{
+			"no duplicate keys in result",
+			[]string{"EULA=FALSE", "MODE=creative"},
+			[]string{"EULA=TRUE", "DIFFICULTY=hard"},
+			[]string{"EULA=TRUE", "MODE=creative", "DIFFICULTY=hard"},
+		},
+		{
+			"bare key treated as a key",
+			[]string{"PATH=/usr/bin", "DEBUG"},
+			[]string{"DEBUG=1"},
+			[]string{"PATH=/usr/bin", "DEBUG=1"},
+		},
+		{
+			"last override for a repeated key wins",
+			[]string{"A=base"},
+			[]string{"A=1", "A=2"},
+			[]string{"A=2"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := MergeEnv(c.base, c.overrides); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("MergeEnv(%v, %v) = %v, want %v", c.base, c.overrides, got, c.want)
+			}
+		})
+	}
+}
+
 // mmdsServer emulates the subset of Firecracker's MMDS the init agent
 // uses: an optional v2 token endpoint and path traversal over the data
 // object the host published, returning leaves as application/json.

@@ -61,6 +61,14 @@ export interface ApiServer {
 export interface CreateServerInput {
   name: string
   version: string
+  // Optional OCI/docker image reference. When set, the control plane pins it to
+  // a digest and the agent boots a squashfs rootfs built from it. Marketplace
+  // launches pass `image_name:image_tag` from the chosen template's manifest.
+  image?: string
+  // Optional per-server environment (a template's resolved answers). The agent
+  // merges these over the image's own env and delivers them to the guest, so
+  // the server boots configured (EULA, game mode, …) without a custom image.
+  env?: Record<string, string>
   cpus?: number
   memory_mb?: number
 }

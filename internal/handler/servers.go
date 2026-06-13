@@ -2,7 +2,10 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"regexp"
+	"sort"
 
 	"github.com/aarani/craftling-go/internal/image"
 	"github.com/aarani/craftling-go/internal/logger"
@@ -39,8 +42,13 @@ type createServerRequest struct {
 	// digest is resolved and pinned here so the rootfs is reproducible.
 	// Empty selects the legacy per-version ext4 image.
 	Image    string `json:"image" binding:"omitempty"`
-	CPUs     int    `json:"cpus" binding:"omitempty,min=1,max=16"`
-	MemoryMB int    `json:"memory_mb" binding:"omitempty,min=512,max=65536"`
+	// Env is the per-server environment, typically a marketplace template's
+	// resolved answers (e.g. {"EULA":"TRUE","MODE":"survival"}). It is stored
+	// as sorted "KEY=VALUE" entries and merged over the image's OCI env by the
+	// agent. Validated manually (see envEntries) rather than via binding tags.
+	Env      map[string]string `json:"env" binding:"omitempty"`
+	CPUs     int               `json:"cpus" binding:"omitempty,min=1,max=16"`
+	MemoryMB int               `json:"memory_mb" binding:"omitempty,min=512,max=65536"`
 }
 
 type updateServerRequest struct {
@@ -59,6 +67,12 @@ func (h *ServerHandler) Create(c *gin.Context) {
 
 	cpus := orDefault(req.CPUs, defaultCPUs)
 	memoryMB := orDefault(req.MemoryMB, defaultMemoryMB)
+
+	env, err := envEntries(req.Env)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// Reject a spec no host could ever run, rather than admitting a server that
 	// would sit unschedulable forever. With no hosts yet, creation is allowed —
@@ -94,6 +108,7 @@ func (h *ServerHandler) Create(c *gin.Context) {
 		Version:      req.Version,
 		Image:        imageRef,
 		ImageDigest:  imageDigest,
+		Env:          env,
 		CPUs:         cpus,
 		MemoryMB:     memoryMB,
 		DesiredState: model.DesiredRunning,
@@ -225,4 +240,42 @@ func orDefault(v, d int) int {
 		return d
 	}
 	return v
+}
+
+// envVarName matches a POSIX-ish environment variable name: a letter or
+// underscore followed by letters, digits, or underscores.
+var envVarName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+const (
+	maxEnvVars     = 100
+	maxEnvValueLen = 8192
+)
+
+// envEntries validates a per-server env map and flattens it into sorted
+// "KEY=VALUE" entries. Sorting makes the stored spec deterministic regardless
+// of JSON object order. Returns nil for an empty map so the server keeps the
+// image's stock environment.
+func envEntries(m map[string]string) ([]string, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	if len(m) > maxEnvVars {
+		return nil, fmt.Errorf("too many env vars: %d (max %d)", len(m), maxEnvVars)
+	}
+	keys := make([]string, 0, len(m))
+	for k, v := range m {
+		if !envVarName.MatchString(k) {
+			return nil, fmt.Errorf("invalid env var name %q", k)
+		}
+		if len(v) > maxEnvValueLen {
+			return nil, fmt.Errorf("env var %q value too long (max %d bytes)", k, maxEnvValueLen)
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = k + "=" + m[k]
+	}
+	return out, nil
 }

@@ -48,6 +48,12 @@ type GameServer struct {
 	Image       string `json:"image,omitempty"`
 	ImageDigest string `json:"image_digest,omitempty"`
 
+	// Env is the per-server environment as "KEY=VALUE" entries, resolved from a
+	// marketplace template's answers at create time. The agent merges these over
+	// the image's own OCI env (these win on conflict) and delivers the result to
+	// the guest init via MMDS. Empty keeps the image's stock environment.
+	Env []string `json:"env,omitempty"`
+
 	DesiredState string `json:"desired_state"`
 	Status       string `json:"status"`
 

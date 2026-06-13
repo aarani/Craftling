@@ -204,6 +204,51 @@ func (s *RunSpec) Argv() []string {
 	return argv
 }
 
+// MergeEnv overlays overrides onto base, returning a new "KEY=VALUE" slice.
+// base keeps its order with values replaced in place when a key recurs in
+// overrides; keys seen only in overrides are appended in their given order.
+// The result has no duplicate keys, so the guest's libc getenv resolves each
+// to the override value regardless of lookup order. Entries without an '='
+// (a bare "KEY") are treated as a key with an empty value. base is the image's
+// OCI env; overrides is the per-server env, which wins on conflict.
+func MergeEnv(base, overrides []string) []string {
+	key := func(kv string) string {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			return kv[:i]
+		}
+		return kv
+	}
+	over := make(map[string]string, len(overrides))
+	order := make([]string, 0, len(overrides))
+	for _, kv := range overrides {
+		k := key(kv)
+		if _, seen := over[k]; !seen {
+			order = append(order, k)
+		}
+		over[k] = kv
+	}
+
+	out := make([]string, 0, len(base)+len(overrides))
+	applied := make(map[string]bool, len(overrides))
+	for _, kv := range base {
+		k := key(kv)
+		if repl, ok := over[k]; ok {
+			if !applied[k] {
+				out = append(out, repl)
+				applied[k] = true
+			}
+			continue // drop the base entry; the override already took its place
+		}
+		out = append(out, kv)
+	}
+	for _, k := range order {
+		if !applied[k] {
+			out = append(out, over[k])
+		}
+	}
+	return out
+}
+
 // MMDSData builds the object the host PUTs into MMDS. The RunSpec is
 // embedded as a single JSON-string leaf rather than as a nested object
 // so the guest never depends on MMDS's handling of typed leaves or

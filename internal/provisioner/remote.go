@@ -48,6 +48,7 @@ func (p *RemoteProvisioner) Provision(ctx context.Context, s *model.GameServer) 
 		MemoryMB:    s.MemoryMB,
 		Image:       s.Image,
 		ImageDigest: s.ImageDigest,
+		Env:         s.Env,
 	})
 	if err != nil {
 		return nil, err
