@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aarani/craftling-go/internal/image"
+	"github.com/aarani/craftling-go/internal/runspec"
 	"github.com/aarani/craftling-go/internal/storage"
 	"go.uber.org/zap"
 )
@@ -35,10 +37,16 @@ type Config struct {
 	// KernelPath is the uncompressed kernel (vmlinux) all VMs boot.
 	KernelPath string
 	// ImageDir holds per-version base rootfs images named "minecraft-<version>.ext4".
+	// Optional when ImageStore is set and every spec carries an OCI image.
 	ImageDir string
 	// DefaultImage is the rootfs filename (within ImageDir) used when a spec's
 	// version has no dedicated image. Empty means an unknown version is rejected.
 	DefaultImage string
+	// ImageStore, when non-nil, builds (or reuses) a read-only squashfs rootfs
+	// from the OCI image a spec names, injecting the in-VM init agent. A spec
+	// with a non-empty Image boots from it instead of the legacy ext4 base; the
+	// image's run spec is published over MMDS. Nil disables the OCI path.
+	ImageStore *image.Store
 	// WorkDir is where per-VM working directories (sockets, writable rootfs,
 	// logs) live. Defaults to a "craftling-fc" dir under the OS temp dir.
 	WorkDir string
@@ -140,8 +148,13 @@ const (
 )
 
 // DefaultBootArgs is a minimal serial-console boot line that mounts the rootfs
-// read-write off the first virtio block device.
+// read-write off the first virtio block device (the legacy ext4 path).
 const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
+
+// ociBootArgs boots an OCI squashfs rootfs: read-only root with the injected
+// Go init agent as PID 1. effectiveBootArgs appends the MMDS ip= directive
+// since these VMs always carry a run spec.
+const ociBootArgs = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=" + runspec.InitPath
 
 // defaultMinecraftPort is the in-VM Minecraft server port. Per-server host port
 // allocation arrives in P6; until then every VM uses the standard port.
@@ -167,13 +180,17 @@ func (c *Config) validate() error {
 	if _, err := os.Stat(c.KernelPath); err != nil {
 		return fmt.Errorf("firecracker: kernel image: %w", err)
 	}
-	if c.ImageDir == "" {
-		return errors.New("firecracker: ImageDir is required")
+	// ImageDir backs the legacy per-version ext4 path; it is optional when an
+	// ImageStore (OCI rootfs) is configured. At least one source must exist.
+	if c.ImageDir == "" && c.ImageStore == nil {
+		return errors.New("firecracker: one of ImageDir or ImageStore is required")
 	}
-	if fi, err := os.Stat(c.ImageDir); err != nil {
-		return fmt.Errorf("firecracker: image dir: %w", err)
-	} else if !fi.IsDir() {
-		return fmt.Errorf("firecracker: image dir %q is not a directory", c.ImageDir)
+	if c.ImageDir != "" {
+		if fi, err := os.Stat(c.ImageDir); err != nil {
+			return fmt.Errorf("firecracker: image dir: %w", err)
+		} else if !fi.IsDir() {
+			return fmt.Errorf("firecracker: image dir %q is not a directory", c.ImageDir)
+		}
 	}
 	if c.natEnabled() {
 		if err := c.validateDataplane(); err != nil {

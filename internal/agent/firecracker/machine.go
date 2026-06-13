@@ -26,12 +26,16 @@ type machine struct {
 	serverID string
 	dir      string // per-VM working directory
 	socket   string // API Unix socket path
-	rootfs   string // writable per-VM rootfs (survives stop/start)
-	kernel   string
-	binary   string // firecracker executable
-	bootArgs string
-	vcpus    int
-	memoryMB int
+	rootfs   string // root drive backing file (per-VM ext4, or shared OCI squashfs)
+	// rootReadOnly attaches the root drive read-only. True for an OCI squashfs
+	// rootfs (immutable, shared across VMs of the same digest); false for the
+	// legacy per-VM ext4 copy, which the guest mounts read-write.
+	rootReadOnly bool
+	kernel       string
+	binary       string // firecracker executable
+	bootArgs     string
+	vcpus        int
+	memoryMB     int
 
 	// runSpec, when non-nil, is published into this VM's MMDS at boot for
 	// the in-VM init agent to fetch. tapName is the host TAP backing the
@@ -132,7 +136,7 @@ func (m *machine) configure(ctx context.Context) error {
 		WithBody(&fcmodels.Drive{
 			DriveID:      &driveID,
 			IsRootDevice: &isRoot,
-			IsReadOnly:   false,
+			IsReadOnly:   m.rootReadOnly,
 			PathOnHost:   m.rootfs,
 		})); err != nil {
 		return fmt.Errorf("root drive: %w", err)

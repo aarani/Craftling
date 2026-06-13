@@ -40,6 +40,14 @@ type GameServer struct {
 	CPUs     int    `json:"cpus"`
 	MemoryMB int    `json:"memory_mb"`
 
+	// Image and ImageDigest pin the OCI/docker image the VM boots from.
+	// When Image is set the agent builds a squashfs rootfs from it (see
+	// internal/image) instead of the legacy per-version ext4 base; the
+	// control plane resolves the digest at create time so the rootfs is
+	// reproducible. Empty Image keeps the legacy path.
+	Image       string `json:"image,omitempty"`
+	ImageDigest string `json:"image_digest,omitempty"`
+
 	DesiredState string `json:"desired_state"`
 	Status       string `json:"status"`
 

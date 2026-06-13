@@ -41,11 +41,13 @@ func (p *RemoteProvisioner) Provision(ctx context.Context, s *model.GameServer) 
 		return nil, err
 	}
 	vm, err := p.client.Provision(ctx, base, agent.VMSpec{
-		ServerID: s.ID,
-		Game:     s.Game,
-		Version:  s.Version,
-		CPUs:     s.CPUs,
-		MemoryMB: s.MemoryMB,
+		ServerID:    s.ID,
+		Game:        s.Game,
+		Version:     s.Version,
+		CPUs:        s.CPUs,
+		MemoryMB:    s.MemoryMB,
+		Image:       s.Image,
+		ImageDigest: s.ImageDigest,
 	})
 	if err != nil {
 		return nil, err

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/aarani/craftling-go/internal/image"
 	"github.com/aarani/craftling-go/internal/logger"
 	"github.com/aarani/craftling-go/internal/middleware"
 	"github.com/aarani/craftling-go/internal/model"
@@ -31,8 +32,13 @@ func NewServerHandler(servers *repository.GameServerRepository, sched *scheduler
 }
 
 type createServerRequest struct {
-	Name     string `json:"name" binding:"required,min=1,max=64"`
-	Version  string `json:"version" binding:"required"`
+	Name    string `json:"name" binding:"required,min=1,max=64"`
+	Version string `json:"version" binding:"required"`
+	// Image is an optional OCI/docker reference. When set, the server
+	// boots a squashfs rootfs built from it (the agent's OCI path); the
+	// digest is resolved and pinned here so the rootfs is reproducible.
+	// Empty selects the legacy per-version ext4 image.
+	Image    string `json:"image" binding:"omitempty"`
 	CPUs     int    `json:"cpus" binding:"omitempty,min=1,max=16"`
 	MemoryMB int    `json:"memory_mb" binding:"omitempty,min=512,max=65536"`
 }
@@ -66,11 +72,28 @@ func (h *ServerHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// Pin the image to an exact digest at create time so the rootfs the
+	// agent builds is reproducible across reschedules and restarts. A bad
+	// reference or an unreachable registry fails creation rather than
+	// admitting a server that can never boot.
+	var imageRef, imageDigest string
+	if req.Image != "" {
+		digest, err := image.ResolveDigest(c.Request.Context(), req.Image)
+		if err != nil {
+			logger.FromContext(c).Warn("resolve image digest", zap.String("image", req.Image), zap.Error(err))
+			c.JSON(http.StatusBadRequest, gin.H{"error": "could not resolve image reference"})
+			return
+		}
+		imageRef, imageDigest = req.Image, digest
+	}
+
 	s := &model.GameServer{
 		OwnerID:      middleware.UserIDFromContext(c),
 		Name:         req.Name,
 		Game:         model.GameMinecraft,
 		Version:      req.Version,
+		Image:        imageRef,
+		ImageDigest:  imageDigest,
 		CPUs:         cpus,
 		MemoryMB:     memoryMB,
 		DesiredState: model.DesiredRunning,

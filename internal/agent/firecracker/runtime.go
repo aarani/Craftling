@@ -145,30 +145,61 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 	if spec.CPUs <= 0 || spec.MemoryMB <= 0 {
 		return nil, fmt.Errorf("firecracker: invalid spec: cpus=%d memory_mb=%d", spec.CPUs, spec.MemoryMB)
 	}
-	baseImage, err := r.cfg.imageFor(spec.Version)
-	if err != nil {
-		return nil, err
-	}
-
 	id := "vm-" + uuid.NewString()
 	dir := filepath.Join(r.cfg.WorkDir, id)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("firecracker: vm dir: %w", err)
 	}
 
-	// A per-VM writable copy of the base image. It survives stop/start so the
-	// world persists across a restart on this host (cross-host persistence is P5).
-	rootfs := filepath.Join(dir, "rootfs.ext4")
-	if err := copyFile(baseImage, rootfs); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("firecracker: stage rootfs: %w", err)
+	// Resolve the root drive. Two paths:
+	//   - OCI image (spec.Image set): build (or reuse) a shared read-only
+	//     squashfs rootfs from the image, taking its run spec as the MMDS base.
+	//     The squashfs lives in the content-addressed image cache and is shared
+	//     across VMs of the same digest, so it is attached in place — not copied
+	//     per VM — and the per-VM dir holds only sockets/logs/world disk.
+	//   - Legacy (no image): a per-VM writable copy of the per-version ext4
+	//     base, mounted read-write, with whatever run spec the caller supplied.
+	var (
+		rootfs       string
+		rootReadOnly bool
+		bootArgs     = r.cfg.BootArgs
+		runSpec      = spec.RunSpec
+	)
+	if spec.Image != "" {
+		if r.cfg.ImageStore == nil {
+			_ = os.RemoveAll(dir)
+			return nil, fmt.Errorf("firecracker: spec names image %q but no image store is configured", spec.Image)
+		}
+		path, ociSpec, err := r.cfg.ImageStore.Ensure(ctx, spec.Image, spec.ImageDigest)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, fmt.Errorf("firecracker: prepare rootfs for %q: %w", spec.Image, err)
+		}
+		rootfs = path
+		rootReadOnly = true
+		bootArgs = ociBootArgs
+		rs := ociSpec
+		runSpec = &rs
+	} else {
+		baseImage, err := r.cfg.imageFor(spec.Version)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
+		// A per-VM writable copy of the base image. It survives stop/start so the
+		// world persists across a restart on this host (cross-host persistence is P5).
+		rootfs = filepath.Join(dir, "rootfs.ext4")
+		if err := copyFile(baseImage, rootfs); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, fmt.Errorf("firecracker: stage rootfs: %w", err)
+		}
 	}
 
 	// Both the NAT dataplane and world persistence augment the runspec the
 	// guest init fetches, and both only apply on the MMDS/runspec path —
 	// legacy ext4 VMs (no runspec) have their own init and stay MMDS-only.
-	// Copy the caller's runspec once so we never mutate a shared struct.
-	runSpec := spec.RunSpec
+	// We already copied the spec above (OCI path) or took the caller's; copy
+	// once more before mutating so we never write through a shared pointer.
 	var vmnet vmNet
 	var worldDisk, worldKey string
 	if runSpec != nil && (r.dp != nil || r.cfg.persistEnabled()) {
@@ -237,24 +268,25 @@ func (r *Runtime) Provision(ctx context.Context, spec agent.VMSpec) (*agent.VM, 
 	}
 
 	m := &machine{
-		id:          id,
-		serverID:    spec.ServerID,
-		dir:         dir,
-		socket:      filepath.Join(dir, "firecracker.sock"),
-		rootfs:      rootfs,
-		kernel:      r.cfg.KernelPath,
-		binary:      r.cfg.BinaryPath,
-		bootArgs:    r.cfg.BootArgs,
-		vcpus:       spec.CPUs,
-		memoryMB:    spec.MemoryMB,
-		runSpec:     runSpec,
-		tapName:     tapNameFor(id),
-		worldDisk:   worldDisk,
-		worldKey:    worldKey,
-		vsockUDS:    vsockUDS,
-		dp:          r.dp,
-		net:         vmnet,
-		servicePort: defaultMinecraftPort,
+		id:           id,
+		serverID:     spec.ServerID,
+		dir:          dir,
+		socket:       filepath.Join(dir, "firecracker.sock"),
+		rootfs:       rootfs,
+		rootReadOnly: rootReadOnly,
+		kernel:       r.cfg.KernelPath,
+		binary:       r.cfg.BinaryPath,
+		bootArgs:     bootArgs,
+		vcpus:        spec.CPUs,
+		memoryMB:     spec.MemoryMB,
+		runSpec:      runSpec,
+		tapName:      tapNameFor(id),
+		worldDisk:    worldDisk,
+		worldKey:     worldKey,
+		vsockUDS:     vsockUDS,
+		dp:           r.dp,
+		net:          vmnet,
+		servicePort:  defaultMinecraftPort,
 	}
 	if err := m.boot(ctx); err != nil {
 		r.releaseNet(vmnet)

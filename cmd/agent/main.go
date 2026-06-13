@@ -19,6 +19,7 @@ import (
 	"github.com/aarani/craftling-go/internal/agent"
 	"github.com/aarani/craftling-go/internal/agent/firecracker"
 	"github.com/aarani/craftling-go/internal/config"
+	"github.com/aarani/craftling-go/internal/image"
 	applogger "github.com/aarani/craftling-go/internal/logger"
 	"github.com/aarani/craftling-go/internal/worldstore"
 	"go.uber.org/zap"
@@ -116,6 +117,7 @@ func newRuntime(cfg *config.Config, log *zap.Logger) (agent.Runtime, error) {
 			ImageDir:         cfg.Agent.Firecracker.ImageDir,
 			DefaultImage:     cfg.Agent.Firecracker.DefaultImage,
 			WorkDir:          cfg.Agent.Firecracker.WorkDir,
+			ImageStore:       imageStore(cfg.Agent.Firecracker),
 			AdvertiseHost:    cfg.Agent.AdvertiseHost,
 			WorldPersistence: cfg.Agent.Firecracker.WorldPersistence,
 			DataDir:          cfg.Agent.Firecracker.DataDir,
@@ -132,6 +134,22 @@ func newRuntime(cfg *config.Config, log *zap.Logger) (agent.Runtime, error) {
 		return agent.NewFakeRuntime(cfg.Agent.AdvertiseHost), nil
 	default:
 		return nil, fmt.Errorf("unknown agent runtime %q", cfg.Agent.Runtime)
+	}
+}
+
+// imageStore builds the OCI→squashfs rootfs store from config, or returns nil
+// when no image cache dir is set (the agent then serves only legacy ext4
+// images). The per-arch init binaries are injected as PID 1 into built rootfs.
+func imageStore(fc config.FirecrackerConfig) *image.Store {
+	if fc.ImageCacheDir == "" {
+		return nil
+	}
+	return &image.Store{
+		CacheDir: fc.ImageCacheDir,
+		Init: image.InitBinaries{
+			LinuxAmd64: fc.InitBinaryAmd64,
+			LinuxArm64: fc.InitBinaryArm64,
+		},
 	}
 }
 

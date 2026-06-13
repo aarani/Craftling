@@ -79,11 +79,24 @@ type FirecrackerConfig struct {
 	// KernelPath is the uncompressed kernel (vmlinux) all VMs boot.
 	KernelPath string
 	// ImageDir holds per-version base rootfs images (minecraft-<version>.ext4).
+	// Optional when an image cache (OCI rootfs) is configured.
 	ImageDir string
 	// DefaultImage is the rootfs filename used when a version has no image.
 	DefaultImage string
 	// WorkDir is where per-VM working dirs live (empty: OS temp dir).
 	WorkDir string
+
+	// ImageCacheDir is where OCI images are converted to and cached as squashfs
+	// rootfs files. When set (with the init binaries below) the agent boots
+	// servers that carry an image reference from a squashfs rootfs built on
+	// demand, instead of a static per-version ext4 base. Empty disables the
+	// OCI path.
+	ImageCacheDir string
+	// InitBinaryAmd64 / InitBinaryArm64 are host paths to the per-arch in-VM
+	// init binary (cmd/init) injected at /.craftling/init when building an OCI
+	// rootfs. Required for the OCI path on the matching guest architecture.
+	InitBinaryAmd64 string
+	InitBinaryArm64 string
 
 	// WorldPersistence enables the per-server world disk + guest overlay
 	// (P5a). Requires mkfs.ext4 on the host and a guest kernel with
@@ -153,6 +166,9 @@ func Load() *Config {
 				ImageDir:         getEnv("FC_IMAGE_DIR", ""),
 				DefaultImage:     getEnv("FC_DEFAULT_IMAGE", ""),
 				WorkDir:          getEnv("FC_WORK_DIR", ""),
+				ImageCacheDir:    getEnv("FC_IMAGE_CACHE_DIR", ""),
+				InitBinaryAmd64:  getEnv("FC_INIT_AMD64", ""),
+				InitBinaryArm64:  getEnv("FC_INIT_ARM64", ""),
 				WorldPersistence: getBoolEnv("FC_WORLD_PERSIST", false),
 				DataDir:          getEnv("FC_DATA_DIR", ""),
 				WorldDiskMB:      getIntEnv("FC_WORLD_DISK_MB", 0),

@@ -43,6 +43,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -209,7 +210,62 @@ func (s *Store) PullImage(_ context.Context, imagePath, expectedDigest string) (
 		_ = os.Remove(tmpPath)
 		return runspec.RunSpec{}, fmt.Errorf("publish rootfs %q: %w", finalPath, err)
 	}
-	return specFromConfig(cfg), nil
+
+	// Record the OCI-derived run spec next to the rootfs (a host-side
+	// sidecar, not baked into the image) so a later boot can reconstruct
+	// the MMDS payload from the cache without re-pulling. See Ensure.
+	spec := specFromConfig(cfg)
+	if err := s.writeRunSpecSidecar(expectedDigest, spec); err != nil {
+		return runspec.RunSpec{}, err
+	}
+	return spec, nil
+}
+
+// Ensure returns the prepared squashfs rootfs path and the OCI-derived
+// run spec for ref@digest, building it (pull + convert) only when it is
+// not already cached. digest is the expected manifest digest — both the
+// integrity check for the pull and the content-addressed cache key; pass
+// the empty string to resolve it from ref first (linux/amd64).
+//
+// This is the Firecracker driver's entry point: it turns an image
+// reference into a bootable read-only rootfs plus the spec to publish
+// over MMDS, reusing the cache across VMs that share a digest.
+func (s *Store) Ensure(ctx context.Context, ref, digest string) (rootfsPath string, spec runspec.RunSpec, err error) {
+	if ref == "" {
+		return "", runspec.RunSpec{}, errors.New("image: empty image reference")
+	}
+	if digest == "" {
+		if digest, err = ResolveDigest(ctx, ref); err != nil {
+			return "", runspec.RunSpec{}, err
+		}
+	}
+	rootfsPath, err = s.PathFor(digest)
+	if err != nil {
+		return "", runspec.RunSpec{}, err
+	}
+	if fileExists(rootfsPath) {
+		if spec, err = s.readRunSpecSidecar(digest); err == nil {
+			return rootfsPath, spec, nil
+		}
+		// Sidecar missing or unreadable (older build, partial write): fall
+		// through and rebuild so the spec is regenerated with the rootfs.
+	}
+	if spec, err = s.PullImage(ctx, pinnedRef(ref, digest), digest); err != nil {
+		return "", runspec.RunSpec{}, err
+	}
+	return rootfsPath, spec, nil
+}
+
+// ResolveDigest resolves ref to its linux/amd64 manifest digest.
+// Firecracker hosts are amd64; multi-arch host selection is a follow-up.
+func ResolveDigest(ctx context.Context, ref string) (string, error) {
+	d, err := crane.Digest(ref,
+		crane.WithContext(ctx),
+		crane.WithPlatform(&v1.Platform{OS: "linux", Architecture: "amd64"}))
+	if err != nil {
+		return "", fmt.Errorf("resolve digest for %q: %w", ref, err)
+	}
+	return d, nil
 }
 
 // PathFor returns the absolute on-disk path of the prepared rootfs for
@@ -223,6 +279,75 @@ func (s *Store) PathFor(digest string) (string, error) {
 	return filepath.Join(s.CacheDir, name), nil
 }
 
+// runspecSuffix names the host-side sidecar that records an image's
+// OCI-derived run spec alongside its <algo>-<hex>.sqsh rootfs.
+const runspecSuffix = ".runspec.json"
+
+// runspecPathFor returns the sidecar path for digest's rootfs.
+func (s *Store) runspecPathFor(digest string) (string, error) {
+	name, err := encodeRootfsName(digest)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(s.CacheDir, strings.TrimSuffix(name, rootfsSuffix)+runspecSuffix), nil
+}
+
+// writeRunSpecSidecar atomically persists spec next to digest's rootfs.
+func (s *Store) writeRunSpecSidecar(digest string, spec runspec.RunSpec) error {
+	p, err := s.runspecPathFor(digest)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("marshal run spec sidecar: %w", err)
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("write run spec sidecar: %w", err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("publish run spec sidecar: %w", err)
+	}
+	return nil
+}
+
+// readRunSpecSidecar loads the run spec recorded for digest's rootfs.
+func (s *Store) readRunSpecSidecar(digest string) (runspec.RunSpec, error) {
+	p, err := s.runspecPathFor(digest)
+	if err != nil {
+		return runspec.RunSpec{}, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return runspec.RunSpec{}, err
+	}
+	var spec runspec.RunSpec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return runspec.RunSpec{}, fmt.Errorf("parse run spec sidecar %q: %w", p, err)
+	}
+	return spec, nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// pinnedRef rewrites ref to pin it to digest (<repo>@<digest>) so the
+// pull resolves the exact manifest the cache is keyed by, dropping any
+// tag or existing digest.
+func pinnedRef(ref, digest string) string {
+	base := ref
+	if i := strings.IndexByte(ref, '@'); i >= 0 {
+		base = ref[:i]
+	} else if i := strings.LastIndexByte(ref, ':'); i > strings.LastIndexByte(ref, '/') {
+		base = ref[:i]
+	}
+	return base + "@" + digest
+}
+
 // UntagImage removes the prepared rootfs for digest. A missing file is
 // not an error — eviction can race against a crash that left no
 // artifact behind, so the caller treats this as best-effort cleanup.
@@ -234,6 +359,12 @@ func (s *Store) UntagImage(_ context.Context, digest string) error {
 	p := filepath.Join(s.CacheDir, name)
 	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove rootfs %q: %w", p, err)
+	}
+	// Drop the run-spec sidecar too so it doesn't outlive its rootfs.
+	if sp, err := s.runspecPathFor(digest); err == nil {
+		if err := os.Remove(sp); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove run spec sidecar %q: %w", sp, err)
+		}
 	}
 	return nil
 }

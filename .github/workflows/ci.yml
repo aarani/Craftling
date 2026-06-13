@@ -137,6 +137,6 @@ jobs:
           FC_KERNEL: /tmp/fcassets/vmlinux
         run: |
           sudo -E env "PATH=$PATH" \
-            go test -tags kvm -count=1 -v -timeout=15m \
-              -run TestKVMMMDSEnvRoundTrip \
+            go test -tags kvm -count=1 -v -timeout=20m \
+              -run 'TestKVMMMDSEnvRoundTrip|TestKVMOCIImageBoot' \
               ./internal/agent/firecracker/...

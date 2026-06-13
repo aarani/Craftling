@@ -41,6 +41,17 @@ type VMSpec struct {
 	CPUs     int    `json:"cpus"`
 	MemoryMB int    `json:"memory_mb"`
 
+	// Image is the OCI/docker image reference whose flattened rootfs the
+	// VM boots. When set, the Firecracker driver builds (or reuses) a
+	// squashfs rootfs from it via internal/image and publishes the
+	// image's run spec over MMDS. Empty selects the legacy per-version
+	// ext4 image path.
+	Image string `json:"image,omitempty"`
+	// ImageDigest pins Image to an exact manifest digest ("sha256:…"),
+	// both verifying the pull and keying the content-addressed rootfs
+	// cache. Empty lets the driver resolve the digest from Image.
+	ImageDigest string `json:"image_digest,omitempty"`
+
 	// RunSpec is the OCI-derived command/env/workdir the guest init
 	// agent should exec, distilled by internal/image at image-pull time.
 	// When set, the Firecracker driver publishes it into the VM's MMDS at
